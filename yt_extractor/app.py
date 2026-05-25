@@ -23,7 +23,13 @@ from PySide6.QtWidgets import (
 )
 
 from .core import (
-    extract_video_id, extract_to_markdown, extract_audio_mp3, ExtractionError,
+    extract_video_id,
+    extract_to_markdown,
+    extract_audio_mp3,
+    ExtractionError,
+    TRANSCRIPT_TIMESTAMPED,
+    TRANSCRIPT_SENTENCES,
+    TRANSCRIPT_PARAGRAPHS,
 )
 
 
@@ -61,7 +67,7 @@ class ExtractWorker(QRunnable):
     """
 
     def __init__(self, row: int, url: str, out_dir: str, outputs: set,
-                 langs, prefer_manual: bool, timestamps: bool, bitrate: str):
+                 langs, prefer_manual: bool, transcript_format: str, bitrate: str):
         super().__init__()
         self.row = row
         self.url = url
@@ -69,7 +75,7 @@ class ExtractWorker(QRunnable):
         self.outputs = outputs
         self.langs = langs
         self.prefer_manual = prefer_manual
-        self.timestamps = timestamps
+        self.transcript_format = transcript_format
         self.bitrate = bitrate
         self.signals = WorkerSignals()
 
@@ -85,7 +91,7 @@ class ExtractWorker(QRunnable):
                     self.url, self.out_dir,
                     preferred_langs=self.langs,
                     prefer_manual=self.prefer_manual,
-                    include_timestamps=self.timestamps,
+                    transcript_format=self.transcript_format,
                     progress=lambda m: self.signals.detail.emit(row, f"[자막] {m}"),
                 )
                 files.append(("자막", str(path)))
@@ -277,9 +283,15 @@ class MainWindow(QMainWindow):
         self.manual_cb.setToolTip("끄면 자동 생성 자막도 동일하게 취급합니다.")
         opt.addWidget(self.manual_cb, 2, 0, 1, 2)
 
-        self.ts_cb = QCheckBox("타임스탬프 포함")
-        self.ts_cb.setChecked(True)
-        opt.addWidget(self.ts_cb, 2, 2, 1, 2)
+        opt.addWidget(QLabel("자막 형식:"), 2, 2)
+        self.format_combo = QComboBox()
+        self.format_combo.addItem("문장 단위 (번역·노션용)", TRANSCRIPT_SENTENCES)
+        self.format_combo.addItem("단락 단위", TRANSCRIPT_PARAGRAPHS)
+        self.format_combo.addItem("타임스탬프", TRANSCRIPT_TIMESTAMPED)
+        self.format_combo.setToolTip(
+            "문장/단락: 타임스탬프 없이 읽기 쉬운 본문. 타임스탬프: 자막 큐 단위."
+        )
+        opt.addWidget(self.format_combo, 2, 3)
 
         # Output-type selection.
         opt.addWidget(QLabel("추출 항목:"), 3, 0)
@@ -365,7 +377,7 @@ class MainWindow(QMainWindow):
         want_a = self.audio_cb.isChecked()
         self.lang_input.setEnabled(want_t)
         self.manual_cb.setEnabled(want_t)
-        self.ts_cb.setEnabled(want_t)
+        self.format_combo.setEnabled(want_t)
         self.bitrate_combo.setEnabled(want_a)
 
     def _set_status_item(self, row: int, status: str):
@@ -446,7 +458,7 @@ class MainWindow(QMainWindow):
         if enabled:
             self._sync_output_controls()  # re-apply per-output enable rules
         else:
-            for w in (self.lang_input, self.manual_cb, self.ts_cb,
+            for w in (self.lang_input, self.manual_cb, self.format_combo,
                       self.bitrate_combo):
                 w.setEnabled(False)
 
@@ -477,7 +489,7 @@ class MainWindow(QMainWindow):
         if not langs:
             langs = ["en"]
         prefer_manual = self.manual_cb.isChecked()
-        timestamps = self.ts_cb.isChecked()
+        transcript_format = self.format_combo.currentData()
         bitrate = self.bitrate_combo.currentText().split()[0]  # "192 kbps" -> "192"
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -495,7 +507,7 @@ class MainWindow(QMainWindow):
             url = self.table.item(row, COL_TITLE).text()
             worker = ExtractWorker(
                 row, url, self.out_dir, outputs,
-                langs, prefer_manual, timestamps, bitrate,
+                langs, prefer_manual, transcript_format, bitrate,
             )
             worker.signals.status.connect(self._on_worker_status)
             worker.signals.detail.connect(self._on_worker_detail)
@@ -616,9 +628,36 @@ def _run_selftest() -> int:
     return 0 if not problems else 1
 
 
+def _run_screenshot(path: str) -> int:
+    """Render the window to a PNG using Qt's own painter (correct fonts).
+
+    Avoids OS screen-capture quirks; used to preview the UI. Returns exit code.
+    """
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.resize(980, 720)
+    win.url_input.setPlainText(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ\n"
+        "https://youtu.be/9bZkp7q19f0"
+    )
+    win.on_add_urls()
+    win.audio_cb.setChecked(True)
+    win.show()
+    for _ in range(5):
+        app.processEvents()
+    pix = win.grab()
+    ok = pix.save(path)
+    print(f"screenshot {'saved' if ok else 'FAILED'}: {path}")
+    return 0 if ok else 1
+
+
 def main():
     if "--selftest" in sys.argv:
         sys.exit(_run_selftest())
+    if "--screenshot" in sys.argv:
+        i = sys.argv.index("--screenshot")
+        out = sys.argv[i + 1] if i + 1 < len(sys.argv) else "screenshot.png"
+        sys.exit(_run_screenshot(out))
     app = QApplication(sys.argv)
     app.setApplicationName("YouTube 자막 추출기")
     win = MainWindow()

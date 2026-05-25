@@ -229,6 +229,24 @@ def fetch_transcript(
 # Markdown formatting & saving
 # --------------------------------------------------------------------------- #
 
+TRANSCRIPT_TIMESTAMPED = "timestamped"
+TRANSCRIPT_SENTENCES = "sentences"
+TRANSCRIPT_PARAGRAPHS = "paragraphs"
+TRANSCRIPT_FORMATS = (
+    TRANSCRIPT_TIMESTAMPED,
+    TRANSCRIPT_SENTENCES,
+    TRANSCRIPT_PARAGRAPHS,
+)
+
+# Gaps between caption cues (seconds). Auto-captions rarely use punctuation.
+_PAUSE_SENTENCE = 1.2
+_PAUSE_PARAGRAPH = 2.5
+# Latin (. ! ?) and CJK (。！？…) sentence terminators, optionally followed by
+# closing quotes/brackets.
+_SENTENCE_END_RE = re.compile(r'[.!?。！？…][\"\'\)\]」』）】]*$')
+_CJK_LANG_PREFIXES = ("ja", "zh", "yue")  # use 。 instead of .
+
+
 def format_timestamp(seconds: float) -> str:
     """Seconds -> H:MM:SS or M:SS."""
     total = int(seconds)
@@ -244,8 +262,139 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
 
 
-def build_markdown(result: TranscriptResult, include_timestamps: bool = True) -> str:
-    """Render a TranscriptResult as a markdown document string."""
+def _join_snippet_text(parts: list[str]) -> str:
+    return " ".join(parts)
+
+
+def _ends_sentence(text: str) -> bool:
+    return bool(_SENTENCE_END_RE.search(text.strip()))
+
+
+def _terminator_for(language_code: str) -> str:
+    """Sentence terminator to append for a given language ('.' or CJK '。')."""
+    lc = (language_code or "").lower()
+    if any(lc.startswith(p) for p in _CJK_LANG_PREFIXES):
+        return "。"
+    return "."
+
+
+def _finalize_sentence(text: str, terminator: str) -> str:
+    """Capitalize the sentence start (Latin) and ensure it ends with punctuation.
+
+    Auto-generated captions are lowercase and unpunctuated, so we add a period
+    (or CJK 。) when a sentence doesn't already end with terminating punctuation.
+    """
+    text = text.strip()
+    if not text:
+        return text
+    # Capitalize a leading ASCII lowercase letter (no-op for Korean/CJK).
+    if text[0].isascii() and text[0].islower():
+        text = text[0].upper() + text[1:]
+    if not _ends_sentence(text):
+        text += terminator
+    return text
+
+
+def _split_into_sentences(snippets: list) -> list[tuple]:
+    """Group caption cues into (text, start, end) sentence tuples.
+
+    A sentence ends at existing terminating punctuation or a >= _PAUSE_SENTENCE
+    gap between cues.
+    """
+    sentences: list[tuple] = []
+    buf: list[str] = []
+    buf_start: float | None = None
+    prev_end: float | None = None
+
+    for text, start, dur in snippets:
+        clean = _clean_text(text)
+        if not clean:
+            continue
+
+        gap = (start - prev_end) if prev_end is not None else None
+        if buf and gap is not None and gap >= _PAUSE_SENTENCE:
+            sentences.append((_join_snippet_text(buf), buf_start, prev_end))
+            buf = []
+
+        if not buf:
+            buf_start = start
+        buf.append(clean)
+        prev_end = start + dur
+
+        if _ends_sentence(_join_snippet_text(buf)):
+            sentences.append((_join_snippet_text(buf), buf_start, prev_end))
+            buf = []
+
+    if buf:
+        sentences.append((_join_snippet_text(buf), buf_start, prev_end))
+
+    return sentences
+
+
+def format_transcript_snippets(
+    snippets: list,
+    style: str = TRANSCRIPT_SENTENCES,
+    language_code: str = "",
+) -> list[str]:
+    """Merge short caption cues into readable, punctuated lines.
+
+    *sentences* — one punctuated sentence per line.
+    *paragraphs* — blank-line-separated blocks (>= ~2.5s pause between topics),
+    each sentence inside still punctuated.
+
+    Because auto-generated captions carry no punctuation, sentence boundaries
+    are inferred from existing punctuation and speech pauses, then a terminator
+    ('.' or CJK '。') is appended so the text reads as proper sentences.
+    """
+    if style not in (TRANSCRIPT_SENTENCES, TRANSCRIPT_PARAGRAPHS):
+        raise ValueError(f"unsupported style: {style}")
+
+    terminator = _terminator_for(language_code)
+    sentences = _split_into_sentences(snippets)
+    final = [
+        (_finalize_sentence(txt, terminator), start, end)
+        for txt, start, end in sentences
+        if _finalize_sentence(txt, terminator)
+    ]
+
+    if style == TRANSCRIPT_SENTENCES:
+        return [txt for txt, _s, _e in final]
+
+    # Paragraphs: join consecutive sentences, breaking on long pauses.
+    joiner = "" if terminator == "。" else " "
+    paragraphs: list[str] = []
+    current: list[str] = []
+    prev_end: float | None = None
+    for txt, start, end in final:
+        if current and prev_end is not None and (start - prev_end) >= _PAUSE_PARAGRAPH:
+            paragraphs.append(joiner.join(current))
+            current = []
+        current.append(txt)
+        prev_end = end
+    if current:
+        paragraphs.append(joiner.join(current))
+
+    return paragraphs
+
+
+def build_markdown(
+    result: TranscriptResult,
+    transcript_format: str = TRANSCRIPT_SENTENCES,
+    *,
+    include_timestamps: bool | None = None,
+) -> str:
+    """Render a TranscriptResult as a markdown document string.
+
+    ``transcript_format`` is one of ``timestamped``, ``sentences``, or
+    ``paragraphs``. ``include_timestamps`` is deprecated; when set, it overrides
+    ``transcript_format`` (True -> timestamped, False -> sentences).
+    """
+    if include_timestamps is not None:
+        transcript_format = (
+            TRANSCRIPT_TIMESTAMPED if include_timestamps else TRANSCRIPT_SENTENCES
+        )
+    if transcript_format not in TRANSCRIPT_FORMATS:
+        raise ValueError(f"unsupported transcript_format: {transcript_format}")
     meta = result.meta
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     kind = "자동 생성" if result.is_generated else "수동 작성"
@@ -268,16 +417,23 @@ def build_markdown(result: TranscriptResult, include_timestamps: bool = True) ->
         "",
     ]
 
-    if include_timestamps:
+    if transcript_format == TRANSCRIPT_TIMESTAMPED:
         for text, start, _dur in result.snippets:
             clean = _clean_text(text)
             if clean:
                 lines.append(f"`[{format_timestamp(start)}]` {clean}")
     else:
-        paragraph = " ".join(
-            _clean_text(t) for t, _s, _d in result.snippets if _clean_text(t)
+        units = format_transcript_snippets(
+            result.snippets, transcript_format,
+            language_code=result.language_code,
         )
-        lines.append(paragraph)
+        for i, unit in enumerate(units):
+            lines.append(unit)
+            if (
+                transcript_format == TRANSCRIPT_PARAGRAPHS
+                and i + 1 < len(units)
+            ):
+                lines.append("")
 
     lines.append("")
     return "\n".join(lines)
@@ -314,7 +470,8 @@ def extract_to_markdown(
     out_dir: str | Path,
     preferred_langs=("ko", "en"),
     prefer_manual: bool = True,
-    include_timestamps: bool = True,
+    transcript_format: str = TRANSCRIPT_SENTENCES,
+    include_timestamps: bool | None = None,
     progress=None,
 ) -> Path:
     """Full pipeline: parse -> meta -> transcript -> markdown -> file.
@@ -338,7 +495,11 @@ def extract_to_markdown(
     )
 
     report("마크다운 저장 중…")
-    content = build_markdown(result, include_timestamps=include_timestamps)
+    content = build_markdown(
+        result,
+        transcript_format=transcript_format,
+        include_timestamps=include_timestamps,
+    )
     filename = safe_filename(meta.title, video_id)
     return save_markdown(content, out_dir, filename)
 
