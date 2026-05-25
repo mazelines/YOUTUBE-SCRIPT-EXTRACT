@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+transcripts/
+*.md.bak
+.DS_Store
+
+# PyInstaller build artifacts
+build/
+dist/
+*.manifest
+selftest_result.txt

@@ -1,0 +1,4 @@
+youtube-transcript-api>=1.2.4
+PySide6>=6.11.1
+yt-dlp>=2026.3.17
+imageio-ffmpeg>=0.5.1
