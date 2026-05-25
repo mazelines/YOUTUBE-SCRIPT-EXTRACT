@@ -12,3 +12,7 @@ build/
 dist/
 *.manifest
 selftest_result.txt
+
+# Bundled native binaries (fetched locally, not committed) — keep the README.
+yt_extractor/bin/*
+!yt_extractor/bin/README.md

@@ -8,7 +8,11 @@ the UI in Qt.
 
 from __future__ import annotations
 
+import os
+import re
 import sys
+import subprocess
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -34,7 +38,10 @@ from .core import (
 
 
 # Columns of the job table.
-COL_TITLE, COL_STATUS, COL_DETAIL, COL_FILE = range(4)
+COL_TITLE, COL_STATUS, COL_PROGRESS, COL_DETAIL, COL_FILE = range(5)
+
+# Pulls a percentage out of an MP3 progress message (e.g. "… 45.2% 1.2MiB/s").
+_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 # Status labels.
 ST_PENDING = "대기 중"
@@ -52,6 +59,28 @@ _STATUS_COLORS = {
 }
 
 
+def _force_kill_process_tree():
+    """Last-resort shutdown: kill this process and all of its children.
+
+    yt-dlp/ffmpeg/aria2c run on QThreadPool threads and spawn child processes;
+    none can always be stopped cooperatively. If a worker is stuck in such
+    native work at exit, terminating the whole tree guarantees the app (and its
+    aria2c/ffmpeg children) never lingers in Task Manager.
+    """
+    pid = os.getpid()
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                creationflags=0x08000000,  # CREATE_NO_WINDOW: no console flash
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+    os._exit(0)
+
+
 class WorkerSignals(QObject):
     """Signals emitted by an ExtractWorker, marshalled to the GUI thread."""
 
@@ -67,7 +96,8 @@ class ExtractWorker(QRunnable):
     """
 
     def __init__(self, row: int, url: str, out_dir: str, outputs: set,
-                 langs, prefer_manual: bool, transcript_format: str, bitrate: str):
+                 langs, prefer_manual: bool, transcript_format: str, bitrate: str,
+                 should_cancel=None):
         super().__init__()
         self.row = row
         self.url = url
@@ -77,15 +107,21 @@ class ExtractWorker(QRunnable):
         self.prefer_manual = prefer_manual
         self.transcript_format = transcript_format
         self.bitrate = bitrate
+        self.should_cancel = should_cancel
         self.signals = WorkerSignals()
+
+    def _cancelled(self) -> bool:
+        return bool(self.should_cancel and self.should_cancel())
 
     @Slot()
     def run(self):
         row = self.row
+        if self._cancelled():
+            return
         self.signals.status.emit(row, ST_RUNNING)
         files, errors = [], []
 
-        if "transcript" in self.outputs:
+        if "transcript" in self.outputs and not self._cancelled():
             try:
                 path = extract_to_markdown(
                     self.url, self.out_dir,
@@ -100,11 +136,12 @@ class ExtractWorker(QRunnable):
             except Exception as e:
                 errors.append(("자막", f"예기치 못한 오류: {e}"))
 
-        if "audio" in self.outputs:
+        if "audio" in self.outputs and not self._cancelled():
             try:
                 path = extract_audio_mp3(
                     self.url, self.out_dir, bitrate=self.bitrate,
                     progress=lambda m: self.signals.detail.emit(row, f"[MP3] {m}"),
+                    should_cancel=self.should_cancel,
                 )
                 files.append(("MP3", str(path)))
             except ExtractionError as e:
@@ -224,6 +261,8 @@ class MainWindow(QMainWindow):
         self._total = 0
         self._completed = 0
         self._running = False
+        # Set on close to tell in-flight workers to abort promptly.
+        self._shutdown = threading.Event()
 
         self._build_ui()
 
@@ -320,9 +359,9 @@ class MainWindow(QMainWindow):
         root.addWidget(opt_group)
 
         # --- Job table ---
-        self.table = QTableWidget(0, 4)
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["영상 / URL", "상태", "상세", "저장 파일"]
+            ["영상 / URL", "상태", "진행률", "상세", "저장 파일"]
         )
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -330,6 +369,8 @@ class MainWindow(QMainWindow):
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(COL_TITLE, QHeaderView.Stretch)
         hdr.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(COL_PROGRESS, QHeaderView.Fixed)
+        self.table.setColumnWidth(COL_PROGRESS, 100)
         hdr.setSectionResizeMode(COL_DETAIL, QHeaderView.Stretch)
         hdr.setSectionResizeMode(COL_FILE, QHeaderView.Stretch)
         self.table.cellDoubleClicked.connect(self.on_row_double_clicked)
@@ -387,11 +428,23 @@ class MainWindow(QMainWindow):
             item.setForeground(QBrush(QColor(color)))
         self.table.setItem(row, COL_STATUS, item)
 
+    def _make_progress_bar(self) -> QProgressBar:
+        """A compact per-row bar tracking that row's MP3 download/convert."""
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(True)
+        bar.setFormat("%p%")
+        bar.setAlignment(Qt.AlignCenter)
+        bar.setFixedHeight(16)
+        return bar
+
     def _add_job_row(self, url: str):
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setItem(row, COL_TITLE, QTableWidgetItem(url))
         self._set_status_item(row, ST_PENDING)
+        self.table.setCellWidget(row, COL_PROGRESS, self._make_progress_bar())
         self.table.setItem(row, COL_DETAIL, QTableWidgetItem(""))
         self.table.setItem(row, COL_FILE, QTableWidgetItem(""))
 
@@ -508,6 +561,7 @@ class MainWindow(QMainWindow):
             worker = ExtractWorker(
                 row, url, self.out_dir, outputs,
                 langs, prefer_manual, transcript_format, bitrate,
+                should_cancel=self._shutdown.is_set,
             )
             worker.signals.status.connect(self._on_worker_status)
             worker.signals.detail.connect(self._on_worker_detail)
@@ -521,6 +575,24 @@ class MainWindow(QMainWindow):
     @Slot(int, str)
     def _on_worker_detail(self, row: int, msg: str):
         self.table.setItem(row, COL_DETAIL, QTableWidgetItem(msg))
+        self._update_mp3_progress(row, msg)
+
+    def _update_mp3_progress(self, row: int, msg: str):
+        """Drive a row's MP3 bar from its [MP3] progress message.
+
+        Tracks the download percentage; once downloading finishes ("변환 중")
+        the encode step reports no progress, so we peg the bar to 100%.
+        """
+        if "[MP3]" not in msg:
+            return
+        bar = self.table.cellWidget(row, COL_PROGRESS)
+        if bar is None:
+            return
+        m = _PCT_RE.search(msg)
+        if m:
+            bar.setValue(int(float(m.group(1))))
+        elif "변환 중" in msg or "저장 완료" in msg:
+            bar.setValue(100)
 
     @Slot(int, object)
     def _on_worker_finished(self, row: int, result: dict):
@@ -561,7 +633,7 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event):
-        # Block close while workers are running to avoid orphaned threads.
+        # Confirm before abandoning in-flight work.
         if self._running:
             resp = QMessageBox.question(
                 self, "작업 진행 중",
@@ -571,9 +643,20 @@ class MainWindow(QMainWindow):
             if resp != QMessageBox.Yes:
                 event.ignore()
                 return
-            self.pool.clear()       # drop queued workers
-            self.pool.waitForDone(2000)
+
+        # Signal workers to abort, drop anything still queued, and give the
+        # running ones a moment to unwind cooperatively.
+        self._shutdown.set()
+        self.pool.clear()
         event.accept()
+        if self.pool.waitForDone(4000):
+            return
+
+        # A worker is stuck in uninterruptible native work (yt-dlp/ffmpeg/aria2c
+        # can't always be cancelled). Without this the QThreadPool thread would
+        # keep the interpreter — and the process — alive after the window closes.
+        # Kill the whole process tree so nothing lingers.
+        _force_kill_process_tree()
 
 
 def _run_selftest() -> int:

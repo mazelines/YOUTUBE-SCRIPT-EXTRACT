@@ -5,6 +5,7 @@ front-ends."""
 from __future__ import annotations
 
 import re
+import sys
 import json
 import datetime as _dt
 from dataclasses import dataclass, field
@@ -536,16 +537,80 @@ def _ffmpeg_location():
         return None  # let yt-dlp find ffmpeg on PATH
 
 
+def _bundled_bin_dirs():
+    """Directories that may hold binaries we ship (e.g. aria2c).
+
+    Covers a PyInstaller one-file build (extracted under sys._MEIPASS) and a
+    plain source checkout (yt_extractor/bin/).
+    """
+    dirs = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(Path(meipass) / "bin")
+        dirs.append(Path(meipass))
+    dirs.append(Path(__file__).resolve().parent / "bin")
+    return dirs
+
+
+def _ensure_aria2c_on_path():
+    """Make an aria2c executable discoverable; return its directory or None.
+
+    Prefers one already on PATH; otherwise, if we bundle aria2c under bin/, we
+    prepend that directory to PATH so yt-dlp's executable lookup finds it (a
+    frozen app's bundled binaries are not on PATH by default).
+    """
+    import os
+    import shutil
+
+    found = shutil.which("aria2c")
+    if found:
+        return os.path.dirname(found)
+
+    exe = "aria2c.exe" if os.name == "nt" else "aria2c"
+    for base in _bundled_bin_dirs():
+        if (base / exe).exists():
+            os.environ["PATH"] = str(base) + os.pathsep + os.environ.get("PATH", "")
+            return str(base)
+    return None
+
+
+def _download_accel_opts():
+    """yt-dlp options that speed up the download (the real bottleneck).
+
+    MP3 encoding is CPU-only and near-instant; GPU codecs apply to video, not
+    audio. So the win is in the network step: prefer aria2c with many parallel
+    connections when available (bundled or on PATH), otherwise fall back to
+    yt-dlp's built-in concurrent fragment downloads. Returns a dict to merge
+    into ydl_opts.
+    """
+    if _ensure_aria2c_on_path():
+        return {
+            "external_downloader": "aria2c",
+            # -x/-s: up to 16 connections/splits per download; -k1M: split size.
+            "external_downloader_args": ["-x16", "-s16", "-k1M"],
+        }
+    # aria2c unavailable: still parallelize fragmented (DASH/HLS) streams.
+    return {"concurrent_fragment_downloads": 4}
+
+
+class _Cancelled(Exception):
+    """Internal signal raised from a yt-dlp hook to abort an in-flight download."""
+
+
 def extract_audio_mp3(
     url_or_id: str,
     out_dir: str | Path,
     bitrate: str = "192",
     progress=None,
+    should_cancel=None,
 ) -> Path:
     """Download a video's audio and convert it to MP3.
 
     `bitrate` is a kbps string ("128", "192", "320"). `progress` is an optional
-    callable(str). Returns the written .mp3 path. Raises ExtractionError.
+    callable(str). `should_cancel` is an optional callable() -> bool; when it
+    returns True (e.g. the app is shutting down) the download is aborted from
+    inside yt-dlp's hooks so the worker thread returns promptly instead of
+    blocking process exit. Returns the written .mp3 path. Raises ExtractionError.
     """
     try:
         import yt_dlp
@@ -558,6 +623,12 @@ def extract_audio_mp3(
         if progress:
             progress(msg)
 
+    def cancelled() -> bool:
+        return bool(should_cancel and should_cancel())
+
+    if cancelled():
+        raise _Cancelled()
+
     report("영상 ID 분석 중…")
     video_id = extract_video_id(url_or_id)
     out = Path(out_dir)
@@ -567,6 +638,9 @@ def extract_audio_mp3(
     final_path = {"path": None}
 
     def progress_hook(d):
+        # Raising here is yt-dlp's supported way to abort a running download.
+        if cancelled():
+            raise _Cancelled()
         status = d.get("status")
         if status == "downloading":
             pct = d.get("_percent_str", "").strip()
@@ -576,6 +650,8 @@ def extract_audio_mp3(
             report("MP3로 변환 중…")
 
     def postproc_hook(d):
+        if cancelled():
+            raise _Cancelled()
         if d.get("status") == "finished":
             info = d.get("info_dict") or {}
             fp = info.get("filepath")
@@ -596,6 +672,7 @@ def extract_audio_mp3(
         "progress_hooks": [progress_hook],
         "postprocessor_hooks": [postproc_hook],
     }
+    ydl_opts.update(_download_accel_opts())
     ffloc = _ffmpeg_location()
     if ffloc:
         ydl_opts["ffmpeg_location"] = ffloc
@@ -603,7 +680,15 @@ def extract_audio_mp3(
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(canonical_url(video_id), download=True)
+    except _Cancelled:
+        raise ExtractionError("작업이 취소되었습니다.")
     except Exception as e:
+        # yt-dlp wraps our _Cancelled in a DownloadError; unwrap that case.
+        if isinstance(e.__cause__, _Cancelled) or isinstance(
+            getattr(e, "exc_info", [None])[1] if hasattr(e, "exc_info") else None,
+            _Cancelled,
+        ):
+            raise ExtractionError("작업이 취소되었습니다.")
         msg = str(e)
         if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower():
             raise ExtractionError(
