@@ -16,7 +16,9 @@ Output: dist/YouTubeTranscriptExtractor.exe  (single file, no console)
 
 import os
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import (
+    collect_submodules, collect_data_files, collect_dynamic_libs,
+)
 
 datas = [("yt_extractor/img/mazelinebanner.jpg", "yt_extractor/img")]
 datas += collect_data_files("imageio_ffmpeg")        # ffmpeg binary
@@ -29,10 +31,21 @@ if os.path.exists(_aria2c):
 
 hiddenimports = collect_submodules("yt_dlp")          # dynamic extractors
 
+# Built-in CPU LLM: bundle llama-cpp-python's compiled library + data, but only
+# if it's installed (keeps builds working on clones without the optional dep).
+# The GGUF model is NOT bundled — it's downloaded from Hugging Face on first use.
+binaries = []
+try:
+    binaries += collect_dynamic_libs("llama_cpp")
+    datas += collect_data_files("llama_cpp")
+    hiddenimports += collect_submodules("llama_cpp")
+except Exception:
+    pass
+
 a = Analysis(
     ["run.py"],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -2,3 +2,10 @@ youtube-transcript-api>=1.2.4
 PySide6>=6.11.1
 yt-dlp>=2026.3.17
 imageio-ffmpeg>=0.5.1
+requests>=2.31.0
+
+# The AI chat's built-in CPU model needs llama-cpp-python, kept OUT of this
+# core file on purpose: it can require a C++ build and shouldn't block the
+# transcript/MP3 install. Install it separately when you want the built-in
+# model:  pip install -r requirements-ai.txt
+# (Remote AI providers — OpenAI/Ollama/SGLang — work without it, via requests.)

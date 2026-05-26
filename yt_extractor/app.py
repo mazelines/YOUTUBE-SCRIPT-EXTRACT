@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPlainTextEdit, QPushButton, QLabel, QLineEdit, QCheckBox, QSpinBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QProgressBar,
-    QGroupBox, QAbstractItemView, QMessageBox, QComboBox, QFrame,
+    QGroupBox, QAbstractItemView, QMessageBox, QComboBox, QFrame, QSplitter,
+    QTextEdit,
 )
 
 from .core import (
@@ -34,6 +35,11 @@ from .core import (
     TRANSCRIPT_TIMESTAMPED,
     TRANSCRIPT_SENTENCES,
     TRANSCRIPT_PARAGRAPHS,
+)
+from .llm import build_messages, stream_chat, LLMError
+from .local_llm import (
+    is_model_present, download_model, stream_local_chat, ensure_loaded,
+    is_loaded,
 )
 
 
@@ -158,6 +164,141 @@ class ExtractWorker(QRunnable):
         self.signals.finished.emit(row, {"files": files, "errors": errors})
 
 
+class ChatSignals(QObject):
+    """Signals emitted by a ChatWorker, marshalled to the GUI thread."""
+
+    token = Signal(str)      # one streamed text delta
+    done = Signal()          # stream completed normally
+    error = Signal(str)      # user-facing failure message
+
+
+class ChatWorker(QRunnable):
+    """Stream one LLM chat completion off the GUI thread.
+
+    Mirrors ExtractWorker: native/blocking work runs here and reaches the UI
+    only through signals. Cancellation is cooperative via an Event.
+    """
+
+    def __init__(self, messages, base_url: str, model: str, api_key: str):
+        super().__init__()
+        self.messages = messages
+        self.base_url = base_url
+        self.model = model
+        self.api_key = api_key
+        self.signals = ChatSignals()
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+
+    @Slot()
+    def run(self):
+        try:
+            stream_chat(
+                self.messages, self.base_url, self.model, api_key=self.api_key,
+                on_token=lambda t: self.signals.token.emit(t),
+                should_cancel=self._cancel.is_set,
+            )
+        except LLMError as e:
+            self.signals.error.emit(str(e))
+            return
+        except Exception as e:  # pragma: no cover - defensive
+            self.signals.error.emit(f"예기치 못한 오류: {e}")
+            return
+        self.signals.done.emit()
+
+
+class BuiltinSignals(QObject):
+    """Signals for the bundled CPU model worker (download + inference)."""
+
+    status = Signal(str)          # high-level phase, e.g. "모델 로딩 중…"
+    progress = Signal(int, int)   # downloaded, total bytes (first-run download)
+    token = Signal(str)           # streamed text delta
+    done = Signal()
+    error = Signal(str)
+
+
+class BuiltinWorker(QRunnable):
+    """Run the built-in model off the GUI thread.
+
+    On first use the model isn't on disk, so this downloads it (reporting
+    progress) before loading and streaming. Cancellation aborts the download or
+    the generation, whichever is in flight.
+    """
+
+    def __init__(self, messages):
+        super().__init__()
+        self.messages = messages
+        self.signals = BuiltinSignals()
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+
+    @Slot()
+    def run(self):
+        try:
+            if not is_model_present():
+                self.signals.status.emit("내장 모델 다운로드 중… (최초 1회)")
+                download_model(
+                    on_progress=lambda d, t: self.signals.progress.emit(d, t),
+                    should_cancel=self._cancel.is_set,
+                )
+            if self._cancel.is_set():
+                return
+            # The model is normally preloaded at startup, so this is just
+            # inference. Only say "로딩 중" if it actually isn't resident yet
+            # (e.g. preload hasn't finished) — otherwise it looks like a reload.
+            if is_loaded():
+                self.signals.status.emit("AI가 처리 중…")
+            else:
+                self.signals.status.emit("모델 로딩 중… (최초 1회는 시간이 걸립니다)")
+            stream_local_chat(
+                self.messages,
+                on_token=lambda t: self.signals.token.emit(t),
+                should_cancel=self._cancel.is_set,
+            )
+        except LLMError as e:
+            self.signals.error.emit(str(e))
+            return
+        except Exception as e:  # pragma: no cover - defensive
+            self.signals.error.emit(f"예기치 못한 오류: {e}")
+            return
+        self.signals.done.emit()
+
+
+class PreloadWorker(QRunnable):
+    """Eagerly download+load the built-in model at startup, off the GUI thread.
+
+    The model then stays resident (cached in local_llm) for the process
+    lifetime, so the first summary has no load delay.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.signals = BuiltinSignals()
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+
+    @Slot()
+    def run(self):
+        try:
+            ensure_loaded(
+                on_status=lambda m: self.signals.status.emit(m),
+                on_progress=lambda d, t: self.signals.progress.emit(d, t),
+                should_cancel=self._cancel.is_set,
+            )
+        except LLMError as e:
+            self.signals.error.emit(str(e))
+            return
+        except Exception as e:  # pragma: no cover - defensive
+            self.signals.error.emit(f"내장 모델 준비 실패: {e}")
+            return
+        self.signals.done.emit()
+
+
 BANNER_URL = "https://mazeline.tech/"
 
 
@@ -250,11 +391,435 @@ class BannerWidget(QFrame):
         super().mousePressEvent(event)
 
 
+class ChatPanel(QWidget):
+    """Right-side AI chat: summarize / translate / Q&A over transcripts.
+
+    The conversation is sent to any OpenAI-compatible endpoint (the URL/model
+    are user-editable here), so the same panel works against a local server or
+    a cloud API. Extracted .md transcripts can be attached as context.
+    """
+
+    # Provider presets. label -> (base_url, default model, needs_key, key_url).
+    # The built-in CPU model is the default so the app works with zero setup;
+    # users who have their own AI account can switch to a cloud/local provider.
+    BUILTIN_PROVIDER = "내장 모델 (GPU/CPU)"
+    PROVIDERS = {
+        BUILTIN_PROVIDER: ("", "", False, ""),
+        "OpenAI": (
+            "https://api.openai.com/v1", "gpt-4o-mini",
+            True, "https://platform.openai.com/api-keys",
+        ),
+        "로컬 Ollama": (
+            "http://localhost:11434/v1", "qwen2.5:1.5b", False, "",
+        ),
+        "로컬 SGLang · vLLM": (
+            "http://localhost:8000/v1", "Qwen/Qwen2.5-1.5B-Instruct", False, "",
+        ),
+        "직접 입력": ("", "", False, ""),
+    }
+    DEFAULT_PROVIDER = BUILTIN_PROVIDER
+
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__()
+        self.mw = main_window
+        # A dedicated single-thread pool keeps chat off the extraction pool, so
+        # a long generation/download never queues behind video extraction (or
+        # steals one of its concurrency slots), and vice versa.
+        self.pool = QThreadPool()
+        self.pool.setMaxThreadCount(1)
+        self._history: list[dict] = []        # prior user/assistant turns
+        self._attached: list[tuple] = []       # (name, text)
+        self._worker: ChatWorker | None = None
+        self._preload_worker: PreloadWorker | None = None
+        self._cursor = None                    # insertion point while streaming
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 0, 0, 0)
+
+        title = QLabel("🤖 AI 채팅 — 자막 요약 · 번역 · Q&A")
+        title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        lay.addWidget(title)
+
+        # --- Endpoint config ---
+        cfg = QGroupBox("AI 서비스 (OpenAI 호환)")
+        cfg_grid = QGridLayout(cfg)
+        cfg_grid.setContentsMargins(8, 6, 8, 6)
+
+        cfg_grid.addWidget(QLabel("제공자:"), 0, 0)
+        self.provider = QComboBox()
+        self.provider.addItems(self.PROVIDERS.keys())
+        self.provider.currentTextChanged.connect(self._on_provider_changed)
+        cfg_grid.addWidget(self.provider, 0, 1, 1, 3)
+
+        cfg_grid.addWidget(QLabel("주소:"), 1, 0)
+        self.base_url = QLineEdit()
+        self.base_url.setToolTip("OpenAI 호환 엔드포인트의 베이스 URL")
+        cfg_grid.addWidget(self.base_url, 1, 1, 1, 3)
+
+        cfg_grid.addWidget(QLabel("모델:"), 2, 0)
+        self.model = QLineEdit()
+        self.model.setToolTip("서비스/서버에서 사용할 모델 이름")
+        cfg_grid.addWidget(self.model, 2, 1)
+        cfg_grid.addWidget(QLabel("API 키:"), 2, 2)
+        self.api_key = QLineEdit()
+        self.api_key.setPlaceholderText("로컬은 비워둠")
+        self.api_key.setEchoMode(QLineEdit.Password)
+        cfg_grid.addWidget(self.api_key, 2, 3)
+
+        # Hint with a clickable link to get a (free) key for the chosen service.
+        self.key_hint = QLabel()
+        self.key_hint.setOpenExternalLinks(True)
+        self.key_hint.setWordWrap(True)
+        self.key_hint.setStyleSheet("color: #7a7a7a; font-size: 11px;")
+        cfg_grid.addWidget(self.key_hint, 3, 0, 1, 4)
+        lay.addWidget(cfg)
+
+        # Apply the default provider (built-in CPU model) to set field state.
+        self.provider.setCurrentText(self.DEFAULT_PROVIDER)
+        self._on_provider_changed(self.DEFAULT_PROVIDER)
+
+        # --- Context indicator ---
+        # Transcripts enter the conversation via the left pane's "AI로 요약"
+        # button, which reads the .md the extractor just produced — so there's
+        # no manual file-picking here. This label just shows what's loaded.
+        self.attach_label = QLabel(
+            "컨텍스트 없음 — 왼쪽에서 자막을 추출한 뒤 'AI로 요약'을 누르세요"
+        )
+        self.attach_label.setStyleSheet("color: #7a7a7a;")
+        self.attach_label.setWordWrap(True)
+        lay.addWidget(self.attach_label)
+
+        # --- Conversation view ---
+        self.view = QTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setPlaceholderText(
+            "왼쪽에서 자막을 추출해 'AI로 요약'을 누르거나, 여기에 질문을 입력하세요."
+        )
+        lay.addWidget(self.view, stretch=1)
+
+        # First-run model download / load indicator (hidden until needed).
+        self.builtin_status = QLabel("")
+        self.builtin_status.setStyleSheet("color: #1769aa; font-size: 11px;")
+        self.builtin_status.setVisible(False)
+        lay.addWidget(self.builtin_status)
+        self.dl_bar = QProgressBar()
+        self.dl_bar.setTextVisible(True)
+        self.dl_bar.setVisible(False)
+        lay.addWidget(self.dl_bar)
+
+        # --- Quick actions ---
+        quick = QHBoxLayout()
+        self.summary_btn = QPushButton("📝 요약")
+        self.summary_btn.clicked.connect(
+            lambda: self._quick("첨부된 자막을 핵심 위주로 한국어로 요약해 주세요.")
+        )
+        quick.addWidget(self.summary_btn)
+        self.translate_btn = QPushButton("🌐 번역")
+        self.translate_btn.clicked.connect(
+            lambda: self._quick("첨부된 자막을 자연스러운 한국어로 번역해 주세요.")
+        )
+        quick.addWidget(self.translate_btn)
+        quick.addStretch(1)
+        lay.addLayout(quick)
+
+        # --- Input + send/stop ---
+        self.input = QPlainTextEdit()
+        self.input.setPlaceholderText("메시지 입력 (Ctrl+Enter 전송)")
+        self.input.setMaximumHeight(80)
+        self.input.installEventFilter(self)
+        lay.addWidget(self.input)
+
+        send_row = QHBoxLayout()
+        self.send_btn = QPushButton("전송")
+        self.send_btn.setStyleSheet("font-weight: bold;")
+        self.send_btn.clicked.connect(self.on_send_clicked)
+        send_row.addWidget(self.send_btn)
+        self.stop_btn = QPushButton("중지")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.on_stop)
+        send_row.addWidget(self.stop_btn)
+        self.reset_btn = QPushButton("대화 초기화")
+        self.reset_btn.clicked.connect(self.on_reset)
+        send_row.addWidget(self.reset_btn)
+        send_row.addStretch(1)
+        lay.addLayout(send_row)
+
+    # Ctrl+Enter (or Cmd+Enter) sends; plain Enter inserts a newline.
+    def eventFilter(self, obj, event):
+        if obj is self.input and event.type() == event.Type.KeyPress:
+            if (event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                    and event.modifiers() & Qt.ControlModifier):
+                self.on_send_clicked()
+                return True
+        return super().eventFilter(obj, event)
+
+    # --------------------------------------------------------- provider ---
+    def _on_provider_changed(self, name: str):
+        cfg = self.PROVIDERS.get(name)
+        if not cfg:
+            return
+        base_url, model, needs_key, key_url = cfg
+        builtin = (name == self.BUILTIN_PROVIDER)
+        # The built-in model needs no endpoint config; grey those controls out.
+        for w in (self.base_url, self.model, self.api_key):
+            w.setEnabled(not builtin)
+        if builtin:
+            self.key_hint.setText(
+                "앱 내장 모델. GPU(NVIDIA·AMD·Intel)가 있으면 자동 가속, "
+                "없으면 CPU로 동작합니다. 설정이 필요 없습니다."
+            )
+            return
+        if name == "직접 입력":
+            self.key_hint.setText("주소·모델·키를 직접 입력하세요.")
+            return
+        self.base_url.setText(base_url)
+        self.model.setText(model)
+        if not needs_key:
+            self.key_hint.setText(
+                "로컬 서버이므로 키가 필요 없습니다. 서버를 먼저 실행하세요."
+            )
+        else:
+            self.key_hint.setText(f'키 발급: <a href="{key_url}">{key_url}</a>')
+
+    @staticmethod
+    def _is_local(base_url: str) -> bool:
+        return ("localhost" in base_url) or ("127.0.0.1" in base_url)
+
+    # ----------------------------------------------------------- context ---
+    def load_transcript(self, name: str, text: str, summarize: bool = False):
+        """Load a generated transcript as the sole chat context.
+
+        Driven by the left pane's "AI로 요약" button, which passes the .md the
+        extractor just produced — the user never hand-picks a file. When
+        `summarize` is set, fires the summary prompt immediately.
+        """
+        # Don't swap context out from under an in-flight answer.
+        if summarize and self._worker is not None:
+            QMessageBox.information(
+                self, "응답 대기 중", "현재 답변이 끝난 뒤 다시 시도하세요."
+            )
+            return
+        self._attached = [(name, text)]
+        self._refresh_context_label()
+        if summarize:
+            self._send("첨부된 자막을 핵심 위주로 한국어로 요약해 주세요.")
+
+    def _clear_context(self):
+        self._attached.clear()
+        self._refresh_context_label()
+
+    def _refresh_context_label(self):
+        if not self._attached:
+            self.attach_label.setText(
+                "컨텍스트 없음 — 왼쪽에서 자막을 추출한 뒤 'AI로 요약'을 누르세요"
+            )
+            self.attach_label.setStyleSheet("color: #7a7a7a;")
+            return
+        names = ", ".join(n for n, _ in self._attached)
+        self.attach_label.setText(f"📎 컨텍스트: {names}")
+        self.attach_label.setStyleSheet("color: #1b7f3b;")
+
+    def _quick(self, prompt: str):
+        if not self._attached:
+            QMessageBox.information(
+                self, "자막 없음",
+                "먼저 왼쪽 목록에서 자막 항목을 선택하고 'AI로 요약'을 눌러 불러오세요.",
+            )
+            return
+        self._send(prompt)
+
+    # -------------------------------------------------------------- send ---
+    def on_send_clicked(self):
+        text = self.input.toPlainText().strip()
+        if not text:
+            return
+        self.input.clear()
+        self._send(text)
+
+    def _send(self, text: str):
+        if self._worker is not None:
+            QMessageBox.information(self, "응답 대기 중", "현재 답변이 끝난 뒤 보내주세요.")
+            return
+        builtin = (self.provider.currentText() == self.BUILTIN_PROVIDER)
+        if not builtin:
+            base_url = self.base_url.text().strip()
+            model = self.model.text().strip()
+            if not base_url or not model:
+                QMessageBox.information(
+                    self, "설정 필요", "AI 서비스 주소와 모델 이름을 입력하세요."
+                )
+                return
+            if not self.api_key.text().strip() and not self._is_local(base_url):
+                QMessageBox.information(
+                    self, "API 키 필요",
+                    "이 서비스는 API 키가 필요합니다. 위 'AI 서비스' 설정에서 키를 입력하세요.",
+                )
+                return
+
+        self._append_role("나", text)
+        messages = build_messages(text, history=self._history,
+                                  transcripts=self._attached)
+        self._history.append({"role": "user", "content": text})
+
+        self._start_assistant_block()
+        self._assistant_buf: list[str] = []
+        self._set_busy(True)
+
+        if builtin:
+            self._start_builtin(messages)
+        else:
+            worker = ChatWorker(messages, self.base_url.text().strip(),
+                                self.model.text().strip(), self.api_key.text())
+            worker.signals.token.connect(self._on_token)
+            worker.signals.done.connect(self._on_done)
+            worker.signals.error.connect(self._on_error)
+            self._worker = worker
+            self.pool.start(worker)
+
+    def _start_builtin(self, messages):
+        """Run the bundled CPU model (downloads it on first use)."""
+        worker = BuiltinWorker(messages)
+        worker.signals.status.connect(self._on_builtin_status)
+        worker.signals.progress.connect(self._on_builtin_progress)
+        worker.signals.token.connect(self._on_token)
+        worker.signals.done.connect(self._on_done)
+        worker.signals.error.connect(self._on_error)
+        self._worker = worker
+        self.pool.start(worker)
+
+    @Slot(str)
+    def _on_builtin_status(self, msg: str):
+        self.builtin_status.setVisible(True)
+        self.builtin_status.setText(msg)
+        if "로딩" in msg or "워밍업" in msg:
+            # Model load / GPU warmup have no measurable progress, so show an
+            # indeterminate (marquee) bar.
+            self.dl_bar.setRange(0, 0)
+            self.dl_bar.setFormat("")
+            self.dl_bar.setVisible(True)
+
+    @Slot(int, int)
+    def _on_builtin_progress(self, done: int, total: int):
+        self.dl_bar.setVisible(True)
+        if total > 0:
+            self.dl_bar.setRange(0, total)
+            self.dl_bar.setValue(done)
+            self.dl_bar.setFormat(f"{done / 1e6:.0f} / {total / 1e6:.0f} MB  (%p%)")
+        else:
+            self.dl_bar.setRange(0, 0)  # indeterminate (unknown size)
+
+    def _hide_builtin_ui(self):
+        self.builtin_status.setVisible(False)
+        self.dl_bar.setVisible(False)
+
+    # --------------------------------------------------------- preload ---
+    def preload_model(self):
+        """Start loading the built-in model now (called once at app startup).
+
+        Downloads it first if needed; the loaded model then stays resident for
+        the whole session, so summaries don't pay a load delay later.
+        """
+        if self._preload_worker is not None:
+            return
+        w = PreloadWorker()
+        w.signals.status.connect(self._on_builtin_status)
+        w.signals.progress.connect(self._on_builtin_progress)
+        w.signals.done.connect(self._on_preload_done)
+        w.signals.error.connect(self._on_preload_error)
+        self._preload_worker = w
+        self.pool.start(w)
+
+    @Slot()
+    def _on_preload_done(self):
+        self._preload_worker = None
+        self.dl_bar.setVisible(False)
+        self.builtin_status.setVisible(True)
+        self.builtin_status.setText("✅ 내장 모델 준비 완료")
+
+    @Slot(str)
+    def _on_preload_error(self, msg: str):
+        self._preload_worker = None
+        self.dl_bar.setVisible(False)
+        self.builtin_status.setVisible(True)
+        self.builtin_status.setText(f"내장 모델 미사용: {msg.splitlines()[0]}")
+
+    def on_stop(self):
+        if self._worker is not None:
+            self._worker.cancel()
+
+    def shutdown(self, timeout: int = 4000) -> bool:
+        """Cancel any in-flight chat/download worker and drain the chat pool.
+
+        Called on app close. Returns True if the pool drained within `timeout`.
+        The model-load step is native and uncancellable, so a False here lets
+        MainWindow fall back to force-killing the process tree.
+        """
+        for w in (self._worker, self._preload_worker):
+            if w is not None:
+                w.cancel()
+        self.pool.clear()
+        return self.pool.waitForDone(timeout)
+
+    def on_reset(self):
+        if self._worker is not None:
+            return
+        self._history.clear()
+        self._clear_context()
+        self.view.clear()
+
+    # ----------------------------------------------------------- streaming --
+    @Slot(str)
+    def _on_token(self, chunk: str):
+        self._hide_builtin_ui()  # generation has begun; clear any download UI
+        self._assistant_buf.append(chunk)
+        self.view.moveCursor(self.view.textCursor().MoveOperation.End)
+        self.view.insertPlainText(chunk)
+        self.view.ensureCursorVisible()
+
+    @Slot()
+    def _on_done(self):
+        self._hide_builtin_ui()
+        answer = "".join(getattr(self, "_assistant_buf", []))
+        if answer:
+            self._history.append({"role": "assistant", "content": answer})
+        self.view.append("")  # blank line after the answer
+        self._worker = None
+        self._set_busy(False)
+
+    @Slot(str)
+    def _on_error(self, msg: str):
+        self._hide_builtin_ui()
+        self.view.append(f"\n⚠️ {msg}\n")
+        # Drop the user turn we optimistically recorded so retry isn't doubled.
+        if self._history and self._history[-1]["role"] == "user":
+            self._history.pop()
+        self._worker = None
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool):
+        self.send_btn.setEnabled(not busy)
+        self.summary_btn.setEnabled(not busy)
+        self.translate_btn.setEnabled(not busy)
+        self.reset_btn.setEnabled(not busy)
+        self.stop_btn.setEnabled(busy)
+
+    def _append_role(self, who: str, text: str):
+        self.view.append(f"<b>{who}</b>")
+        self.view.append(text)
+        self.view.append("")
+
+    def _start_assistant_block(self):
+        self.view.append("<b>AI</b>")
+        # Subsequent tokens are inserted as plain text right after this header.
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("YouTube 자막 추출기")
-        self.resize(960, 640)
+        self.resize(1280, 720)
 
         self.pool = QThreadPool.globalInstance()
         self.out_dir = str(Path.cwd() / "transcripts")
@@ -270,7 +835,12 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        outer = QVBoxLayout(central)
+
+        # Left pane holds the entire existing extraction UI; the chat panel
+        # sits to its right in a splitter, and the banner spans the bottom.
+        left = QWidget()
+        root = QVBoxLayout(left)
 
         # --- Input group ---
         in_group = QGroupBox("영상 URL (한 줄에 하나씩 입력)")
@@ -395,6 +965,13 @@ class MainWindow(QMainWindow):
         self.open_dir_btn.clicked.connect(self.on_open_dir)
         action.addWidget(self.open_dir_btn)
 
+        self.summarize_btn = QPushButton("🤖 AI로 요약")
+        self.summarize_btn.setToolTip(
+            "선택한(또는 가장 최근) 자막을 오른쪽 AI 채팅으로 불러와 요약합니다."
+        )
+        self.summarize_btn.clicked.connect(self.on_ai_summarize)
+        action.addWidget(self.summarize_btn)
+
         action.addStretch(1)
         root.addLayout(action)
 
@@ -404,9 +981,20 @@ class MainWindow(QMainWindow):
         self.progress.setFormat("%v / %m")
         root.addWidget(self.progress)
 
-        # --- Company ad banner (clickable) ---
+        # --- Right pane: AI chat ---
+        self.chat = ChatPanel(self)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left)
+        splitter.addWidget(self.chat)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([760, 500])
+        outer.addWidget(splitter, stretch=1)
+
+        # --- Company ad banner (clickable, spans full width at the bottom) ---
         self.banner = BannerWidget(image_path=_banner_image_path())
-        root.addWidget(self.banner)
+        outer.addWidget(self.banner)
 
         self.statusBar().showMessage("준비됨")
 
@@ -502,6 +1090,36 @@ class MainWindow(QMainWindow):
             if path and Path(path).exists():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
                 return
+
+    def _selected_transcript_path(self):
+        """The .md transcript to summarize: the selected row's, else newest."""
+        selected = [i.row() for i in self.table.selectionModel().selectedRows()]
+        order = selected + sorted(self._paths_by_row, reverse=True)
+        seen = set()
+        for row in order:
+            if row in seen:
+                continue
+            seen.add(row)
+            for p in self._paths_by_row.get(row, []):
+                if p.lower().endswith(".md") and Path(p).exists():
+                    return p
+        return None
+
+    def on_ai_summarize(self):
+        path = self._selected_transcript_path()
+        if not path:
+            QMessageBox.information(
+                self, "자막 없음",
+                "요약할 자막이 없습니다. 먼저 자막(.md)을 추출한 뒤, "
+                "표에서 항목을 선택하고 다시 누르세요.",
+            )
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError as e:
+            QMessageBox.warning(self, "읽기 실패", str(e))
+            return
+        self.chat.load_transcript(Path(path).name, text, summarize=True)
 
     def _set_controls_enabled(self, enabled: bool):
         for w in (self.start_btn, self.add_btn, self.dir_btn,
@@ -645,17 +1263,20 @@ class MainWindow(QMainWindow):
                 return
 
         # Signal workers to abort, drop anything still queued, and give the
-        # running ones a moment to unwind cooperatively.
+        # running ones a moment to unwind cooperatively. The chat panel has its
+        # own pool (and its own download/inference worker), so drain both.
         self._shutdown.set()
         self.pool.clear()
         event.accept()
-        if self.pool.waitForDone(4000):
+        ext_done = self.pool.waitForDone(4000)
+        chat_done = self.chat.shutdown(timeout=4000)
+        if ext_done and chat_done:
             return
 
-        # A worker is stuck in uninterruptible native work (yt-dlp/ffmpeg/aria2c
-        # can't always be cancelled). Without this the QThreadPool thread would
-        # keep the interpreter — and the process — alive after the window closes.
-        # Kill the whole process tree so nothing lingers.
+        # A worker is stuck in uninterruptible native work (yt-dlp/ffmpeg/aria2c,
+        # or the model load). Without this the QThreadPool thread would keep the
+        # interpreter — and the process — alive after the window closes. Kill the
+        # whole process tree so nothing lingers.
         _force_kill_process_tree()
 
 
@@ -688,6 +1309,16 @@ def _run_selftest() -> int:
     except Exception as e:
         problems.append(f"yt_dlp import failed: {e}")
 
+    # Built-in CPU model engine is optional (bundled only when llama-cpp-python
+    # is installed at build time). Report whether it loaded so a release that's
+    # meant to ship the model can confirm the compiled libs resolved — but don't
+    # fail the test, since model-less builds are valid too.
+    try:
+        import llama_cpp  # noqa: F401
+        llama_status = f"llama_cpp {getattr(llama_cpp, '__version__', '?')}"
+    except Exception as e:
+        llama_status = f"llama_cpp absent ({e.__class__.__name__})"
+
     # Instantiate the GUI offscreen to confirm widgets/resources load.
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -701,6 +1332,7 @@ def _run_selftest() -> int:
         problems.append(f"GUI instantiation failed: {e}")
 
     result = "SELFTEST OK" if not problems else "SELFTEST FAIL: " + "; ".join(problems)
+    result += f" | {llama_status}"
     out = os.environ.get("SELFTEST_OUT")
     if out:
         try:
@@ -745,6 +1377,10 @@ def main():
     app.setApplicationName("YouTube 자막 추출기")
     win = MainWindow()
     win.show()
+    # Eagerly load the built-in model now so it's ready (and stays resident)
+    # for the whole session. Done only on the real run — not in --selftest /
+    # --screenshot — so those never trigger a multi-GB download/load.
+    win.chat.preload_model()
     sys.exit(app.exec())
 
 

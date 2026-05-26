@@ -24,6 +24,21 @@ pip install -r requirements.txt
 
 - Python 3.10 이상 권장 (개발 환경: 3.12)
 
+### AI 채팅 (선택)
+
+우측 **AI 채팅** 패널로 추출한 자막을 요약·번역·질문할 수 있습니다. 기본 제공자는 **앱 내장 모델**로 **Gemma 4 E4B**(Apache-2.0)를 사용하며, 첫 사용 시 Hugging Face에서 모델(약 5.3GB)을 자동으로 내려받아 캐시합니다(이후 오프라인). 프로그램 시작 시 모델을 미리 로드(+워밍업)해 두며, **GPU(NVIDIA·AMD·Intel)가 있으면 Vulkan으로 자동 가속**(CPU 대비 약 10~20배)하고 없으면 CPU로 동작합니다(CPU는 RAM 약 6GB, GPU는 VRAM 약 6GB 사용). 내장 모델을 쓰려면 `llama-cpp-python`이 필요합니다(아래 참고).
+
+> ⚠️ **AVX512 주의**: abetlen의 사전빌드 CPU 휠(`--extra-index-url .../whl/cpu`)은 **AVX512로 컴파일**돼 있어, AVX512가 없는 CPU(인텔 12~14세대 등 **대부분의 컨슈머 CPU 포함**)에서 모델 로드 시 `STATUS_ILLEGAL_INSTRUCTION (0xC000001D)`로 죽습니다. 배포용 빌드에는 사용하지 마세요. 대신 **AVX2로 소스 빌드**하세요(2013년 이후 거의 모든 CPU 호환):
+
+```bash
+# C++ 툴체인 필요 (Windows: MSVC + CMake/Ninja)
+# Windows (CP949 등 비 UTF-8 로캘에서 /utf-8 필수):
+set CMAKE_ARGS=-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DCMAKE_C_FLAGS=/utf-8 -DCMAKE_CXX_FLAGS=/utf-8
+pip install "llama-cpp-python>=0.3.0" --no-binary llama-cpp-python --no-cache-dir
+```
+
+내장 모델 없이도, 채팅 패널의 **제공자**를 OpenAI·Ollama·SGLang/vLLM·직접 입력으로 바꿔 본인 계정/로컬 서버로 쓸 수 있습니다(이 경우 위 추가 설치 불필요).
+
 ## 실행
 
 ```bash

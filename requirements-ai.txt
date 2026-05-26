@@ -1,0 +1,37 @@
+# Optional: the AI chat's BUILT-IN model (자막 요약/번역/Q&A 오프라인 모델).
+# Not needed for transcript/MP3 extraction, nor for remote AI providers
+# (OpenAI / Ollama / SGLang), which work with the core requirements alone.
+# The packaged .exe already bundles everything below — this file is for running
+# from source.
+#
+# Model weights are NOT installed here — Gemma 4 E4B (Q4_K_M) downloads from
+# Hugging Face on first use (~5.3 GB; ~6 GB RAM on CPU, or VRAM on GPU) and
+# caches under %LOCALAPPDATA%/YouTubeTranscriptExtractor. (Apache-2.0, ungated.)
+#
+# The app uses the GPU when one is available (n_gpu_layers=-1, with a startup
+# warmup) and falls back to CPU otherwise — same install covers both.
+#
+# ── RECOMMENDED: Vulkan build (NVIDIA/AMD/Intel GPU + AVX2 CPU fallback) ───────
+# Vulkan works on ALL GPU vendors and the backend DLL is small (~60 MB, vs
+# ~1.5 GB for CUDA). The runtime needs only the GPU driver's vulkan-1.dll
+# (present on any modern Windows GPU). Build from source (no prebuilt wheel):
+#   1) Install the LunarG Vulkan SDK (https://vulkan.lunarg.com) — provides
+#      glslc, headers, vulkan-1.lib. Sets VULKAN_SDK.
+#   2) In a VS x64 dev shell (MSVC + CMake/Ninja):
+#      set CMAKE_GENERATOR=Ninja
+#      set CMAKE_ARGS=-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_VULKAN=ON -DCMAKE_C_FLAGS=/utf-8 -DCMAKE_CXX_FLAGS=/utf-8
+#      pip install llama-cpp-python>=0.3.0 --no-binary llama-cpp-python --no-cache-dir
+# Vulkan summary on a discrete GPU is ~10-20x faster than CPU (≈ on par with
+# CUDA after the one-time shader warmup). On a machine with no GPU it loads and
+# runs on the (AVX2) CPU backend.
+#
+# ⚠️ Do NOT use the prebuilt CPU wheel (…/whl/cpu): it's compiled with AVX512 and
+#    crashes (STATUS_ILLEGAL_INSTRUCTION 0xC000001D) on most consumer CPUs.
+#
+# ── ALTERNATIVE: CPU-only AVX2 build (no GPU) ─────────────────────────────────
+# Same as above but drop -DGGML_VULKAN=ON (and the Vulkan SDK isn't needed).
+#
+# (CUDA is also possible via the cu124 wheel for NVIDIA-only, but it pulls
+#  ~1.5 GB of cuBLAS/kernels — Vulkan is preferred for size + vendor coverage.)
+
+llama-cpp-python>=0.3.0
