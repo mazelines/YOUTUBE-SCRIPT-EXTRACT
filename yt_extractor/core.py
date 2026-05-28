@@ -189,6 +189,57 @@ def _select_transcript(transcript_list, preferred_langs, prefer_manual):
     raise NoTranscriptFound(transcript_list.video_id, langs, transcript_list)
 
 
+def fetch_translated_transcript(
+    video_id: str,
+    target_lang: str = "ko",
+    meta: VideoMeta | None = None,
+) -> TranscriptResult | None:
+    """Fetch any available transcript translated into ``target_lang`` via YouTube.
+
+    Picks a translatable source (preferring manual over auto-generated) that
+    YouTube offers ``target_lang`` for, calls ``.translate(target_lang).fetch()``,
+    and returns the result. Returns ``None`` when no translatable transcript
+    advertises the target language (most often: the video has no captions, or
+    the only caption is a manually-uploaded one YouTube refuses to translate).
+    """
+    api = YouTubeTranscriptApi()
+    try:
+        transcript_list = api.list(video_id)
+    except Exception:
+        return None
+
+    chosen = None
+    for t in transcript_list:
+        if not t.is_translatable:
+            continue
+        if not any(tl.language_code == target_lang
+                   for tl in t.translation_languages):
+            continue
+        if chosen is None or (chosen.is_generated and not t.is_generated):
+            chosen = t
+            if not t.is_generated:
+                break  # manual + translatable: best possible source
+    if chosen is None:
+        return None
+
+    try:
+        translated = chosen.translate(target_lang)
+        fetched = translated.fetch()
+    except Exception:
+        return None
+
+    snippets = [(s.text, s.start, s.duration) for s in fetched]
+    if meta is None:
+        meta = VideoMeta(video_id=video_id, title=video_id)
+    return TranscriptResult(
+        meta=meta,
+        language=translated.language,
+        language_code=translated.language_code,
+        is_generated=True,  # YouTube translations are machine-produced
+        snippets=snippets,
+    )
+
+
 def fetch_transcript(
     video_id: str,
     preferred_langs=("ko", "en"),
@@ -443,15 +494,22 @@ def build_markdown(
 _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def safe_filename(title: str, video_id: str, max_len: int = 80) -> str:
-    """Build a filesystem-safe markdown filename from a title + video id."""
+def safe_filename(
+    title: str, video_id: str, max_len: int = 80, lang_tag: str = ""
+) -> str:
+    """Build a filesystem-safe markdown filename from a title + video id.
+
+    `lang_tag` (e.g. ``"ko"``) yields ``"... [id].ko.md"`` — used to save a
+    translated variant next to the original without colliding with it.
+    """
     base = _INVALID_FS.sub("_", title).strip().strip(".")
     base = re.sub(r"\s+", " ", base)
     if len(base) > max_len:
         base = base[:max_len].rstrip()
     if not base:
         base = "transcript"
-    return f"{base} [{video_id}].md"
+    tag = f".{lang_tag}" if lang_tag else ""
+    return f"{base} [{video_id}]{tag}.md"
 
 
 def save_markdown(content: str, out_dir: str | Path, filename: str) -> Path:
@@ -473,12 +531,20 @@ def extract_to_markdown(
     prefer_manual: bool = True,
     transcript_format: str = TRANSCRIPT_SENTENCES,
     include_timestamps: bool | None = None,
+    translate_to: str | None = None,
     progress=None,
-) -> Path:
+) -> list[Path]:
     """Full pipeline: parse -> meta -> transcript -> markdown -> file.
 
+    When ``translate_to`` is a language code (e.g. ``"ko"``) and the source
+    transcript is in a different language, a second ``.md`` is written next to
+    the original with a ``.{lang}.md`` suffix, using YouTube's built-in
+    translation. Translation is best-effort: if the video has no translatable
+    caption, only the original is saved (no error raised).
+
     `progress` is an optional callable(str) for status messages. Returns the
-    written file path. Raises ExtractionError on any handled failure.
+    list of written file paths (1 or 2). Raises ExtractionError on any handled
+    failure of the primary extraction.
     """
     def report(msg):
         if progress:
@@ -501,8 +567,28 @@ def extract_to_markdown(
         transcript_format=transcript_format,
         include_timestamps=include_timestamps,
     )
-    filename = safe_filename(meta.title, video_id)
-    return save_markdown(content, out_dir, filename)
+    written = [save_markdown(content, out_dir, safe_filename(meta.title, video_id))]
+
+    if translate_to:
+        target = translate_to.strip().lower()
+        src = (result.language_code or "").lower()
+        # Skip when the source already matches (no point re-translating ko→ko),
+        # treating "ko" and "ko-KR" as equivalent for this check.
+        if target and target.split("-")[0] != src.split("-")[0]:
+            report(f"{target} 번역 가져오는 중…")
+            translated = fetch_translated_transcript(video_id, target, meta=meta)
+            if translated is not None:
+                report(f"{target} 번역 저장 중…")
+                t_content = build_markdown(
+                    translated,
+                    transcript_format=transcript_format,
+                    include_timestamps=include_timestamps,
+                )
+                t_name = safe_filename(meta.title, video_id, lang_tag=target)
+                written.append(save_markdown(t_content, out_dir, t_name))
+            else:
+                report(f"{target} 번역 자막을 사용할 수 없습니다 (원문만 저장)")
+    return written
 
 
 # --------------------------------------------------------------------------- #

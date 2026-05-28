@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl,
+    Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl, QTimer,
 )
 from PySide6.QtGui import QDesktopServices, QBrush, QColor, QPixmap
 from PySide6.QtWidgets import (
@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QPushButton, QLabel, QLineEdit, QCheckBox, QSpinBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QProgressBar,
     QGroupBox, QAbstractItemView, QMessageBox, QComboBox, QFrame, QSplitter,
-    QTextEdit,
+    QTextBrowser, QTabWidget,
 )
 
 from .core import (
@@ -41,6 +41,7 @@ from .local_llm import (
     is_model_present, download_model, stream_local_chat, ensure_loaded,
     is_loaded,
 )
+from .chat_render import render_conversation
 
 
 # Columns of the job table.
@@ -103,7 +104,7 @@ class ExtractWorker(QRunnable):
 
     def __init__(self, row: int, url: str, out_dir: str, outputs: set,
                  langs, prefer_manual: bool, transcript_format: str, bitrate: str,
-                 should_cancel=None):
+                 translate_to: str | None = None, should_cancel=None):
         super().__init__()
         self.row = row
         self.url = url
@@ -113,6 +114,7 @@ class ExtractWorker(QRunnable):
         self.prefer_manual = prefer_manual
         self.transcript_format = transcript_format
         self.bitrate = bitrate
+        self.translate_to = translate_to
         self.should_cancel = should_cancel
         self.signals = WorkerSignals()
 
@@ -129,14 +131,17 @@ class ExtractWorker(QRunnable):
 
         if "transcript" in self.outputs and not self._cancelled():
             try:
-                path = extract_to_markdown(
+                paths = extract_to_markdown(
                     self.url, self.out_dir,
                     preferred_langs=self.langs,
                     prefer_manual=self.prefer_manual,
                     transcript_format=self.transcript_format,
+                    translate_to=self.translate_to,
                     progress=lambda m: self.signals.detail.emit(row, f"[자막] {m}"),
                 )
-                files.append(("자막", str(path)))
+                for i, p in enumerate(paths):
+                    label = "자막" if i == 0 else f"번역({self.translate_to})"
+                    files.append((label, str(p)))
             except ExtractionError as e:
                 errors.append(("자막", str(e)))
             except Exception as e:
@@ -391,12 +396,226 @@ class BannerWidget(QFrame):
         super().mousePressEvent(event)
 
 
+SUMMARY_PROMPT = "첨부된 자막을 핵심 위주로 한국어로 요약해 주세요."
+TRANSLATE_PROMPT = "첨부된 자막을 자연스러운 한국어로 번역해 주세요."
+
+
+class ChatTab(QWidget):
+    """One conversation strand (요약 or 번역) inside a parent ChatPanel.
+
+    Each tab keeps its own history, view, input, and worker so summarizing on
+    one tab and translating on the other don't interleave in a single chat
+    log. The shared provider config and attached transcript live on the parent
+    panel and are pulled in here on send.
+    """
+
+    def __init__(self, panel: "ChatPanel", quick_label: str, quick_prompt: str,
+                 placeholder: str = ""):
+        super().__init__()
+        self.panel = panel
+        self.quick_prompt = quick_prompt
+        self._history: list[dict] = []
+        self._worker: ChatWorker | BuiltinWorker | None = None
+        self._streaming_assistant: str | None = None
+        self._last_error: str | None = None
+        # Coalesce stream-driven re-renders (~80 ms) so a fast model doesn't
+        # trigger one setHtml() per token.
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._rerender)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 6, 0, 0)
+
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        # Force a white canvas regardless of system palette — chat bubbles are
+        # tuned for a light page.
+        self.view.setStyleSheet(
+            "QTextBrowser { background-color: #ffffff; color: #222222; }"
+        )
+        self.view.setPlaceholderText(placeholder)
+        lay.addWidget(self.view, stretch=1)
+
+        quick = QHBoxLayout()
+        self.quick_btn = QPushButton(quick_label)
+        self.quick_btn.clicked.connect(self.run_quick_prompt)
+        quick.addWidget(self.quick_btn)
+        quick.addStretch(1)
+        lay.addLayout(quick)
+
+        self.input = QPlainTextEdit()
+        self.input.setPlaceholderText("메시지 입력 (Ctrl+Enter 전송)")
+        self.input.setMaximumHeight(80)
+        self.input.installEventFilter(self)
+        lay.addWidget(self.input)
+
+        send_row = QHBoxLayout()
+        self.send_btn = QPushButton("전송")
+        self.send_btn.setStyleSheet("font-weight: bold;")
+        self.send_btn.clicked.connect(self.on_send_clicked)
+        send_row.addWidget(self.send_btn)
+        self.stop_btn = QPushButton("중지")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.on_stop)
+        send_row.addWidget(self.stop_btn)
+        self.reset_btn = QPushButton("대화 초기화")
+        self.reset_btn.clicked.connect(self.on_reset)
+        send_row.addWidget(self.reset_btn)
+        send_row.addStretch(1)
+        lay.addLayout(send_row)
+
+    # Ctrl+Enter (or Cmd+Enter) sends; plain Enter inserts a newline.
+    def eventFilter(self, obj, event):
+        if obj is self.input and event.type() == event.Type.KeyPress:
+            if (event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                    and event.modifiers() & Qt.ControlModifier):
+                self.on_send_clicked()
+                return True
+        return super().eventFilter(obj, event)
+
+    def run_quick_prompt(self):
+        if not self.panel._attached:
+            QMessageBox.information(
+                self, "자막 없음",
+                "먼저 왼쪽 목록에서 자막 항목을 선택하고 'AI로 요약' 또는 "
+                "'AI로 번역'을 눌러 불러오세요.",
+            )
+            return
+        self._send(self.quick_prompt)
+
+    def on_send_clicked(self):
+        text = self.input.toPlainText().strip()
+        if not text:
+            return
+        self.input.clear()
+        self._send(text)
+
+    def _send(self, text: str):
+        if self._worker is not None:
+            QMessageBox.information(self, "응답 대기 중",
+                                    "현재 답변이 끝난 뒤 보내주세요.")
+            return
+        panel = self.panel
+        builtin = (panel.provider.currentText() == panel.BUILTIN_PROVIDER)
+        if not builtin:
+            base_url = panel.base_url.text().strip()
+            model = panel.model.text().strip()
+            if not base_url or not model:
+                QMessageBox.information(
+                    self, "설정 필요", "AI 서비스 주소와 모델 이름을 입력하세요."
+                )
+                return
+            if not panel.api_key.text().strip() and not panel._is_local(base_url):
+                QMessageBox.information(
+                    self, "API 키 필요",
+                    "이 서비스는 API 키가 필요합니다. 위 'AI 서비스' 설정에서 "
+                    "키를 입력하세요.",
+                )
+                return
+
+        messages = build_messages(text, history=self._history,
+                                  transcripts=panel._attached)
+        self._history.append({"role": "user", "content": text})
+        # Empty in-flight assistant turn — _rerender() shows it as a bubble
+        # with a streaming cursor until tokens fill it in.
+        self._streaming_assistant = ""
+        self._last_error = None
+        self._set_busy(True)
+        self._rerender()
+
+        if builtin:
+            worker = BuiltinWorker(messages)
+            worker.signals.status.connect(panel._on_builtin_status)
+            worker.signals.progress.connect(panel._on_builtin_progress)
+        else:
+            worker = ChatWorker(messages, panel.base_url.text().strip(),
+                                panel.model.text().strip(),
+                                panel.api_key.text())
+        worker.signals.token.connect(self._on_token)
+        worker.signals.done.connect(self._on_done)
+        worker.signals.error.connect(self._on_error)
+        self._worker = worker
+        panel.pool.start(worker)
+
+    def on_stop(self):
+        if self._worker is not None:
+            self._worker.cancel()
+
+    def on_reset(self):
+        if self._worker is not None:
+            return
+        self._history.clear()
+        self._streaming_assistant = None
+        self._last_error = None
+        self._rerender()
+
+    def cancel_worker(self):
+        if self._worker is not None:
+            self._worker.cancel()
+
+    @Slot(str)
+    def _on_token(self, chunk: str):
+        self.panel._hide_builtin_ui()  # generation has begun
+        if self._streaming_assistant is None:
+            self._streaming_assistant = ""
+        self._streaming_assistant += chunk
+        if not self._render_timer.isActive():
+            self._render_timer.start(80)
+
+    @Slot()
+    def _on_done(self):
+        self.panel._hide_builtin_ui()
+        self._render_timer.stop()
+        answer = self._streaming_assistant or ""
+        if answer:
+            self._history.append({"role": "assistant", "content": answer})
+        self._streaming_assistant = None
+        self._worker = None
+        self._set_busy(False)
+        self._rerender()
+
+    @Slot(str)
+    def _on_error(self, msg: str):
+        self.panel._hide_builtin_ui()
+        self._render_timer.stop()
+        # Drop the user turn we optimistically recorded so retry isn't doubled.
+        if self._history and self._history[-1]["role"] == "user":
+            self._history.pop()
+        self._streaming_assistant = None
+        self._last_error = msg
+        self._worker = None
+        self._set_busy(False)
+        self._rerender()
+
+    def _set_busy(self, busy: bool):
+        self.send_btn.setEnabled(not busy)
+        self.quick_btn.setEnabled(not busy)
+        self.reset_btn.setEnabled(not busy)
+        self.stop_btn.setEnabled(busy)
+
+    def _rerender(self):
+        streaming = self._streaming_assistant is not None
+        turns = list(self._history)
+        if streaming:
+            turns.append({"role": "assistant",
+                          "content": self._streaming_assistant or ""})
+        html_doc = render_conversation(
+            turns, streaming=streaming, error=self._last_error,
+        )
+        sb = self.view.verticalScrollBar()
+        stick = sb.value() >= sb.maximum() - 8
+        self.view.setHtml(html_doc)
+        if stick:
+            sb.setValue(sb.maximum())
+
+
 class ChatPanel(QWidget):
     """Right-side AI chat: summarize / translate / Q&A over transcripts.
 
-    The conversation is sent to any OpenAI-compatible endpoint (the URL/model
-    are user-editable here), so the same panel works against a local server or
-    a cloud API. Extracted .md transcripts can be attached as context.
+    Hosts two independent conversation tabs (요약 / 번역) that share the same
+    provider config and attached transcript. Each tab keeps its own history so
+    the two workflows don't pollute each other.
     """
 
     # Provider presets. label -> (base_url, default model, needs_key, key_url).
@@ -424,14 +643,12 @@ class ChatPanel(QWidget):
         self.mw = main_window
         # A dedicated single-thread pool keeps chat off the extraction pool, so
         # a long generation/download never queues behind video extraction (or
-        # steals one of its concurrency slots), and vice versa.
+        # steals one of its concurrency slots), and vice versa. Both tabs share
+        # this pool; the single worker thread serializes their sends.
         self.pool = QThreadPool()
         self.pool.setMaxThreadCount(1)
-        self._history: list[dict] = []        # prior user/assistant turns
-        self._attached: list[tuple] = []       # (name, text)
-        self._worker: ChatWorker | None = None
+        self._attached: list[tuple] = []       # (name, text) — shared by tabs
         self._preload_worker: PreloadWorker | None = None
-        self._cursor = None                    # insertion point while streaming
         self._build()
 
     def _build(self):
@@ -481,25 +698,20 @@ class ChatPanel(QWidget):
         self._on_provider_changed(self.DEFAULT_PROVIDER)
 
         # --- Context indicator ---
-        # Transcripts enter the conversation via the left pane's "AI로 요약"
-        # button, which reads the .md the extractor just produced — so there's
-        # no manual file-picking here. This label just shows what's loaded.
+        # Transcripts enter the conversation via the left pane's "AI로 요약" /
+        # "AI로 번역" button, which reads the .md the extractor just produced
+        # — so there's no manual file-picking here. This label just shows what's
+        # loaded; it's shared between tabs since both operate on the same .md.
         self.attach_label = QLabel(
-            "컨텍스트 없음 — 왼쪽에서 자막을 추출한 뒤 'AI로 요약'을 누르세요"
+            "컨텍스트 없음 — 왼쪽에서 자막을 추출한 뒤 'AI로 요약' 또는 "
+            "'AI로 번역'을 누르세요"
         )
         self.attach_label.setStyleSheet("color: #7a7a7a;")
         self.attach_label.setWordWrap(True)
         lay.addWidget(self.attach_label)
 
-        # --- Conversation view ---
-        self.view = QTextEdit()
-        self.view.setReadOnly(True)
-        self.view.setPlaceholderText(
-            "왼쪽에서 자막을 추출해 'AI로 요약'을 누르거나, 여기에 질문을 입력하세요."
-        )
-        lay.addWidget(self.view, stretch=1)
-
-        # First-run model download / load indicator (hidden until needed).
+        # First-run model download / load indicator (hidden until needed) —
+        # shared because either tab's send can be the trigger.
         self.builtin_status = QLabel("")
         self.builtin_status.setStyleSheet("color: #1769aa; font-size: 11px;")
         self.builtin_status.setVisible(False)
@@ -509,51 +721,25 @@ class ChatPanel(QWidget):
         self.dl_bar.setVisible(False)
         lay.addWidget(self.dl_bar)
 
-        # --- Quick actions ---
-        quick = QHBoxLayout()
-        self.summary_btn = QPushButton("📝 요약")
-        self.summary_btn.clicked.connect(
-            lambda: self._quick("첨부된 자막을 핵심 위주로 한국어로 요약해 주세요.")
+        # --- Tabs: separate conversations for summary vs translation ---
+        self.tabs = QTabWidget()
+        self.summary_tab = ChatTab(
+            self, "📝 자막 요약 시작", SUMMARY_PROMPT,
+            placeholder=(
+                "왼쪽에서 자막을 추출해 'AI로 요약'을 누르거나, "
+                "여기에 질문을 입력하세요."
+            ),
         )
-        quick.addWidget(self.summary_btn)
-        self.translate_btn = QPushButton("🌐 번역")
-        self.translate_btn.clicked.connect(
-            lambda: self._quick("첨부된 자막을 자연스러운 한국어로 번역해 주세요.")
+        self.translate_tab = ChatTab(
+            self, "🌐 자막 번역 시작", TRANSLATE_PROMPT,
+            placeholder=(
+                "왼쪽에서 자막을 추출해 'AI로 번역'을 누르거나, "
+                "여기에 번역할 부분을 입력하세요."
+            ),
         )
-        quick.addWidget(self.translate_btn)
-        quick.addStretch(1)
-        lay.addLayout(quick)
-
-        # --- Input + send/stop ---
-        self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("메시지 입력 (Ctrl+Enter 전송)")
-        self.input.setMaximumHeight(80)
-        self.input.installEventFilter(self)
-        lay.addWidget(self.input)
-
-        send_row = QHBoxLayout()
-        self.send_btn = QPushButton("전송")
-        self.send_btn.setStyleSheet("font-weight: bold;")
-        self.send_btn.clicked.connect(self.on_send_clicked)
-        send_row.addWidget(self.send_btn)
-        self.stop_btn = QPushButton("중지")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.on_stop)
-        send_row.addWidget(self.stop_btn)
-        self.reset_btn = QPushButton("대화 초기화")
-        self.reset_btn.clicked.connect(self.on_reset)
-        send_row.addWidget(self.reset_btn)
-        send_row.addStretch(1)
-        lay.addLayout(send_row)
-
-    # Ctrl+Enter (or Cmd+Enter) sends; plain Enter inserts a newline.
-    def eventFilter(self, obj, event):
-        if obj is self.input and event.type() == event.Type.KeyPress:
-            if (event.key() in (Qt.Key_Return, Qt.Key_Enter)
-                    and event.modifiers() & Qt.ControlModifier):
-                self.on_send_clicked()
-                return True
-        return super().eventFilter(obj, event)
+        self.tabs.addTab(self.summary_tab, "📝 요약")
+        self.tabs.addTab(self.translate_tab, "🌐 번역")
+        lay.addWidget(self.tabs, stretch=1)
 
     # --------------------------------------------------------- provider ---
     def _on_provider_changed(self, name: str):
@@ -588,15 +774,18 @@ class ChatPanel(QWidget):
         return ("localhost" in base_url) or ("127.0.0.1" in base_url)
 
     # ----------------------------------------------------------- context ---
-    def load_transcript(self, name: str, text: str, summarize: bool = False):
-        """Load a generated transcript as the sole chat context.
+    def load_transcript(self, name: str, text: str, *,
+                        summarize: bool = False, translate: bool = False):
+        """Load a transcript as the chat context and optionally fire a prompt.
 
-        Driven by the left pane's "AI로 요약" button, which passes the .md the
-        extractor just produced — the user never hand-picks a file. When
-        `summarize` is set, fires the summary prompt immediately.
+        Driven by the left pane's "AI로 요약" / "AI로 번역" buttons; switches to
+        the matching tab and kicks off the default prompt for it. The attached
+        transcript is shared — both tabs see the same .md.
         """
-        # Don't swap context out from under an in-flight answer.
-        if summarize and self._worker is not None:
+        target = (self.summary_tab if summarize else
+                  self.translate_tab if translate else None)
+        # Don't swap context out from under that tab's in-flight answer.
+        if target is not None and target._worker is not None:
             QMessageBox.information(
                 self, "응답 대기 중", "현재 답변이 끝난 뒤 다시 시도하세요."
             )
@@ -604,16 +793,17 @@ class ChatPanel(QWidget):
         self._attached = [(name, text)]
         self._refresh_context_label()
         if summarize:
-            self._send("첨부된 자막을 핵심 위주로 한국어로 요약해 주세요.")
-
-    def _clear_context(self):
-        self._attached.clear()
-        self._refresh_context_label()
+            self.tabs.setCurrentWidget(self.summary_tab)
+            self.summary_tab._send(SUMMARY_PROMPT)
+        elif translate:
+            self.tabs.setCurrentWidget(self.translate_tab)
+            self.translate_tab._send(TRANSLATE_PROMPT)
 
     def _refresh_context_label(self):
         if not self._attached:
             self.attach_label.setText(
-                "컨텍스트 없음 — 왼쪽에서 자막을 추출한 뒤 'AI로 요약'을 누르세요"
+                "컨텍스트 없음 — 왼쪽에서 자막을 추출한 뒤 'AI로 요약' 또는 "
+                "'AI로 번역'을 누르세요"
             )
             self.attach_label.setStyleSheet("color: #7a7a7a;")
             return
@@ -621,74 +811,7 @@ class ChatPanel(QWidget):
         self.attach_label.setText(f"📎 컨텍스트: {names}")
         self.attach_label.setStyleSheet("color: #1b7f3b;")
 
-    def _quick(self, prompt: str):
-        if not self._attached:
-            QMessageBox.information(
-                self, "자막 없음",
-                "먼저 왼쪽 목록에서 자막 항목을 선택하고 'AI로 요약'을 눌러 불러오세요.",
-            )
-            return
-        self._send(prompt)
-
-    # -------------------------------------------------------------- send ---
-    def on_send_clicked(self):
-        text = self.input.toPlainText().strip()
-        if not text:
-            return
-        self.input.clear()
-        self._send(text)
-
-    def _send(self, text: str):
-        if self._worker is not None:
-            QMessageBox.information(self, "응답 대기 중", "현재 답변이 끝난 뒤 보내주세요.")
-            return
-        builtin = (self.provider.currentText() == self.BUILTIN_PROVIDER)
-        if not builtin:
-            base_url = self.base_url.text().strip()
-            model = self.model.text().strip()
-            if not base_url or not model:
-                QMessageBox.information(
-                    self, "설정 필요", "AI 서비스 주소와 모델 이름을 입력하세요."
-                )
-                return
-            if not self.api_key.text().strip() and not self._is_local(base_url):
-                QMessageBox.information(
-                    self, "API 키 필요",
-                    "이 서비스는 API 키가 필요합니다. 위 'AI 서비스' 설정에서 키를 입력하세요.",
-                )
-                return
-
-        self._append_role("나", text)
-        messages = build_messages(text, history=self._history,
-                                  transcripts=self._attached)
-        self._history.append({"role": "user", "content": text})
-
-        self._start_assistant_block()
-        self._assistant_buf: list[str] = []
-        self._set_busy(True)
-
-        if builtin:
-            self._start_builtin(messages)
-        else:
-            worker = ChatWorker(messages, self.base_url.text().strip(),
-                                self.model.text().strip(), self.api_key.text())
-            worker.signals.token.connect(self._on_token)
-            worker.signals.done.connect(self._on_done)
-            worker.signals.error.connect(self._on_error)
-            self._worker = worker
-            self.pool.start(worker)
-
-    def _start_builtin(self, messages):
-        """Run the bundled CPU model (downloads it on first use)."""
-        worker = BuiltinWorker(messages)
-        worker.signals.status.connect(self._on_builtin_status)
-        worker.signals.progress.connect(self._on_builtin_progress)
-        worker.signals.token.connect(self._on_token)
-        worker.signals.done.connect(self._on_done)
-        worker.signals.error.connect(self._on_error)
-        self._worker = worker
-        self.pool.start(worker)
-
+    # ----------------------------------------------------- builtin model UI --
     @Slot(str)
     def _on_builtin_status(self, msg: str):
         self.builtin_status.setVisible(True)
@@ -745,74 +868,19 @@ class ChatPanel(QWidget):
         self.builtin_status.setVisible(True)
         self.builtin_status.setText(f"내장 모델 미사용: {msg.splitlines()[0]}")
 
-    def on_stop(self):
-        if self._worker is not None:
-            self._worker.cancel()
-
     def shutdown(self, timeout: int = 4000) -> bool:
-        """Cancel any in-flight chat/download worker and drain the chat pool.
+        """Cancel any in-flight workers (both tabs + preload) and drain the pool.
 
         Called on app close. Returns True if the pool drained within `timeout`.
         The model-load step is native and uncancellable, so a False here lets
         MainWindow fall back to force-killing the process tree.
         """
-        for w in (self._worker, self._preload_worker):
-            if w is not None:
-                w.cancel()
+        for tab in (self.summary_tab, self.translate_tab):
+            tab.cancel_worker()
+        if self._preload_worker is not None:
+            self._preload_worker.cancel()
         self.pool.clear()
         return self.pool.waitForDone(timeout)
-
-    def on_reset(self):
-        if self._worker is not None:
-            return
-        self._history.clear()
-        self._clear_context()
-        self.view.clear()
-
-    # ----------------------------------------------------------- streaming --
-    @Slot(str)
-    def _on_token(self, chunk: str):
-        self._hide_builtin_ui()  # generation has begun; clear any download UI
-        self._assistant_buf.append(chunk)
-        self.view.moveCursor(self.view.textCursor().MoveOperation.End)
-        self.view.insertPlainText(chunk)
-        self.view.ensureCursorVisible()
-
-    @Slot()
-    def _on_done(self):
-        self._hide_builtin_ui()
-        answer = "".join(getattr(self, "_assistant_buf", []))
-        if answer:
-            self._history.append({"role": "assistant", "content": answer})
-        self.view.append("")  # blank line after the answer
-        self._worker = None
-        self._set_busy(False)
-
-    @Slot(str)
-    def _on_error(self, msg: str):
-        self._hide_builtin_ui()
-        self.view.append(f"\n⚠️ {msg}\n")
-        # Drop the user turn we optimistically recorded so retry isn't doubled.
-        if self._history and self._history[-1]["role"] == "user":
-            self._history.pop()
-        self._worker = None
-        self._set_busy(False)
-
-    def _set_busy(self, busy: bool):
-        self.send_btn.setEnabled(not busy)
-        self.summary_btn.setEnabled(not busy)
-        self.translate_btn.setEnabled(not busy)
-        self.reset_btn.setEnabled(not busy)
-        self.stop_btn.setEnabled(busy)
-
-    def _append_role(self, who: str, text: str):
-        self.view.append(f"<b>{who}</b>")
-        self.view.append(text)
-        self.view.append("")
-
-    def _start_assistant_block(self):
-        self.view.append("<b>AI</b>")
-        # Subsequent tokens are inserted as plain text right after this header.
 
 
 class MainWindow(QMainWindow):
@@ -921,6 +989,13 @@ class MainWindow(QMainWindow):
         self.bitrate_combo.setCurrentIndex(1)  # 192
         opt.addWidget(self.bitrate_combo, 3, 3)
 
+        self.translate_cb = QCheckBox("🌐 한국어 번역도 함께 저장 (.ko.md)")
+        self.translate_cb.setToolTip(
+            "원문이 한국어가 아닐 때, YouTube의 번역 자막을 별도 '.ko.md' "
+            "파일로 함께 저장합니다. 번역 자막이 없는 영상은 원문만 저장합니다."
+        )
+        opt.addWidget(self.translate_cb, 4, 0, 1, 4)
+
         # Enable/disable dependent controls with their output type.
         self.transcript_cb.toggled.connect(self._sync_output_controls)
         self.audio_cb.toggled.connect(self._sync_output_controls)
@@ -967,10 +1042,19 @@ class MainWindow(QMainWindow):
 
         self.summarize_btn = QPushButton("🤖 AI로 요약")
         self.summarize_btn.setToolTip(
-            "선택한(또는 가장 최근) 자막을 오른쪽 AI 채팅으로 불러와 요약합니다."
+            "선택한(또는 가장 최근) 자막을 오른쪽 AI 채팅 '요약' 탭으로 "
+            "불러와 한국어로 요약합니다."
         )
         self.summarize_btn.clicked.connect(self.on_ai_summarize)
         action.addWidget(self.summarize_btn)
+
+        self.translate_ai_btn = QPushButton("🌐 AI로 번역")
+        self.translate_ai_btn.setToolTip(
+            "선택한(또는 가장 최근) 자막을 오른쪽 AI 채팅 '번역' 탭으로 "
+            "불러와 자연스러운 한국어로 번역합니다."
+        )
+        self.translate_ai_btn.clicked.connect(self.on_ai_translate)
+        action.addWidget(self.translate_ai_btn)
 
         action.addStretch(1)
         root.addLayout(action)
@@ -1007,6 +1091,7 @@ class MainWindow(QMainWindow):
         self.lang_input.setEnabled(want_t)
         self.manual_cb.setEnabled(want_t)
         self.format_combo.setEnabled(want_t)
+        self.translate_cb.setEnabled(want_t)
         self.bitrate_combo.setEnabled(want_a)
 
     def _set_status_item(self, row: int, status: str):
@@ -1106,11 +1191,19 @@ class MainWindow(QMainWindow):
         return None
 
     def on_ai_summarize(self):
+        self._ai_dispatch_transcript(summarize=True)
+
+    def on_ai_translate(self):
+        self._ai_dispatch_transcript(translate=True)
+
+    def _ai_dispatch_transcript(self, *, summarize: bool = False,
+                                translate: bool = False):
         path = self._selected_transcript_path()
         if not path:
+            action = "요약" if summarize else "번역"
             QMessageBox.information(
                 self, "자막 없음",
-                "요약할 자막이 없습니다. 먼저 자막(.md)을 추출한 뒤, "
+                f"{action}할 자막이 없습니다. 먼저 자막(.md)을 추출한 뒤, "
                 "표에서 항목을 선택하고 다시 누르세요.",
             )
             return
@@ -1119,7 +1212,9 @@ class MainWindow(QMainWindow):
         except OSError as e:
             QMessageBox.warning(self, "읽기 실패", str(e))
             return
-        self.chat.load_transcript(Path(path).name, text, summarize=True)
+        self.chat.load_transcript(
+            Path(path).name, text, summarize=summarize, translate=translate,
+        )
 
     def _set_controls_enabled(self, enabled: bool):
         for w in (self.start_btn, self.add_btn, self.dir_btn,
@@ -1130,7 +1225,7 @@ class MainWindow(QMainWindow):
             self._sync_output_controls()  # re-apply per-output enable rules
         else:
             for w in (self.lang_input, self.manual_cb, self.format_combo,
-                      self.bitrate_combo):
+                      self.translate_cb, self.bitrate_combo):
                 w.setEnabled(False)
 
     def on_start(self):
@@ -1162,6 +1257,7 @@ class MainWindow(QMainWindow):
         prefer_manual = self.manual_cb.isChecked()
         transcript_format = self.format_combo.currentData()
         bitrate = self.bitrate_combo.currentText().split()[0]  # "192 kbps" -> "192"
+        translate_to = "ko" if self.translate_cb.isChecked() else None
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
 
         self.pool.setMaxThreadCount(self.concurrency.value())
@@ -1179,6 +1275,7 @@ class MainWindow(QMainWindow):
             worker = ExtractWorker(
                 row, url, self.out_dir, outputs,
                 langs, prefer_manual, transcript_format, bitrate,
+                translate_to=translate_to,
                 should_cancel=self._shutdown.is_set,
             )
             worker.signals.status.connect(self._on_worker_status)
