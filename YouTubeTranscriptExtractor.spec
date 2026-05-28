@@ -31,6 +31,12 @@ if os.path.exists(_aria2c):
 
 hiddenimports = collect_submodules("yt_dlp")          # dynamic extractors
 
+# Chat HTML renderer: markdown loads extensions by name string and pygments
+# loads its style/lexer modules dynamically — PyInstaller's static scan misses
+# both, so bundle the whole packages.
+hiddenimports += collect_submodules("markdown")
+hiddenimports += collect_submodules("pygments")
+
 # Built-in CPU LLM: bundle llama-cpp-python's compiled library + data, but only
 # if it's installed (keeps builds working on clones without the optional dep).
 # The GGUF model is NOT bundled — it's downloaded from Hugging Face on first use.

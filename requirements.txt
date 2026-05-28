@@ -4,6 +4,12 @@ yt-dlp>=2026.3.17
 imageio-ffmpeg>=0.5.1
 requests>=2.31.0
 
+# AI chat renderer: convert assistant markdown -> styled HTML for QTextBrowser
+# (headers, lists, tables, fenced code with syntax highlighting). Pure-Python,
+# tiny — bundles cleanly with PyInstaller.
+markdown>=3.5
+pygments>=2.17
+
 # The AI chat's built-in CPU model needs llama-cpp-python, kept OUT of this
 # core file on purpose: it can require a C++ build and shouldn't block the
 # transcript/MP3 install. Install it separately when you want the built-in

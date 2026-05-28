@@ -16,3 +16,8 @@ selftest_result.txt
 # Bundled native binaries (fetched locally, not committed) — keep the README.
 yt_extractor/bin/*
 !yt_extractor/bin/README.md
+
+# Claude Code local config: ignore machine-specific files and throwaway
+# screenshots, but keep the project-scoped skills directory.
+.claude/settings.local.json
+.claude/*.png
