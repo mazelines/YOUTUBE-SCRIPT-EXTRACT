@@ -1,0 +1,65 @@
+version: 47
+
+jobs:
+- name: Build Windows EXE
+  steps:
+  - type: CheckoutStep
+    name: checkout
+    cloneCredential:
+      type: DefaultCredential
+    withLfs: false
+    withSubmodules: false
+    condition: SUCCESSFUL
+    optional: false
+  - type: CommandStep
+    name: install dependencies
+    runInContainer: false
+    interpreter:
+      type: DefaultInterpreter
+      commands: |
+        @echo off
+        echo === Installing Python dependencies ===
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+    useTTY: false
+    condition: SUCCESSFUL
+    optional: false
+  - type: CommandStep
+    name: build exe
+    runInContainer: false
+    interpreter:
+      type: DefaultInterpreter
+      commands: |
+        @echo off
+        echo === Building YouTubeTranscriptExtractor.exe ===
+        pyinstaller --noconfirm --clean YouTubeTranscriptExtractor.spec
+        echo === Build complete ===
+        dir dist\YouTubeTranscriptExtractor.exe
+    useTTY: false
+    condition: SUCCESSFUL
+    optional: false
+  - type: CommandStep
+    name: self-test
+    runInContainer: false
+    interpreter:
+      type: DefaultInterpreter
+      commands: |
+        @echo off
+        echo === Running self-test ===
+        dist\YouTubeTranscriptExtractor.exe --selftest
+        if %ERRORLEVEL% EQU 0 (
+          echo SELF-TEST PASSED
+        ) else (
+          echo SELF-TEST FAILED with exit code %ERRORLEVEL%
+          exit /b %ERRORLEVEL%
+        )
+    useTTY: false
+    condition: SUCCESSFUL
+    optional: false
+  triggers:
+  - type: BranchUpdateTrigger
+    branches: master
+  retryCondition: never
+  maxRetries: 3
+  timeout: 600
