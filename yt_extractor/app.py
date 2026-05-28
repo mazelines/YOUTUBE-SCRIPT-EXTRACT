@@ -429,10 +429,10 @@ class ChatTab(QWidget):
 
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
-        # Force a white canvas regardless of system palette — chat bubbles are
+        # Force a light canvas regardless of system palette — chat bubbles are
         # tuned for a light page.
         self.view.setStyleSheet(
-            "QTextBrowser { background-color: #ffffff; color: #222222; }"
+            "QTextBrowser { background-color: #f6f6f6; color: #222222; }"
         )
         self.view.setPlaceholderText(placeholder)
         lay.addWidget(self.view, stretch=1)

@@ -50,7 +50,7 @@ def _md_to_html(text: str) -> str:
 _DOC_STYLE = """
 <style>
   body { font-family: 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
-         font-size: 13px; color: #222; background: #ffffff; }
+         font-size: 13px; color: #222; background: #f6f6f6; }
   .turn { padding: 10px 14px; margin: 6px 0; }
   .turn-user { background: #eef5ff; border-left: 3px solid #1769aa; }
   .turn-ai   { background: #f6f6f6; border-left: 3px solid #1b7f3b; }
