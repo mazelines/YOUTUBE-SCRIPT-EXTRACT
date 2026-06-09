@@ -1,3 +1,5 @@
+ftp-config.json
+
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -21,3 +23,15 @@ yt_extractor/bin/*
 # screenshots, but keep the project-scoped skills directory.
 .claude/settings.local.json
 .claude/*.png
+
+design_handoff_lime_forward/
+
+.omc/
+
+.agents/
+
+tests/
+
+*.log
+
+ftp-config.example.json
