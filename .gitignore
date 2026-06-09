@@ -1,3 +1,5 @@
+ftp-config.json
+
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -31,3 +33,5 @@ design_handoff_lime_forward/
 tests/
 
 *.log
+
+ftp-config.example.json

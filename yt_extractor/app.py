@@ -1531,6 +1531,12 @@ def main():
         sys.exit(_run_screenshot(out))
     app = QApplication(sys.argv)
     app.setApplicationName("YouTube 자막 추출기")
+
+    from yt_extractor.splash import make_splash
+    splash = make_splash()
+    splash.show()
+    app.processEvents()
+
     app.setStyleSheet("""
         QWidget { background-color: #f6f2ea; color: #2a2622;
                   font-family: 'Gothic A1', 'Apple SD Gothic Neo', 'Malgun Gothic', system-ui, sans-serif; }
@@ -1625,6 +1631,29 @@ def main():
     """)
     win = MainWindow()
     win.show()
+    app.processEvents()
+
+    # Always open on primary monitor (frameGeometry is valid after show)
+    primary = app.primaryScreen().geometry()
+    fg = win.frameGeometry()
+    win.move(
+        primary.x() + (primary.width() - fg.width()) // 2,
+        primary.y() + (primary.height() - fg.height()) // 2,
+    )
+
+    QTimer.singleShot(3000, lambda: splash.finish(win))
+
+    from yt_extractor.updater import UpdateChecker
+    _checker = UpdateChecker()
+    _checker.update_available.connect(
+        lambda v: QMessageBox.information(
+            win, "업데이트 사용 가능",
+            f"새 버전 {v} 이(가) 출시됐습니다.\n"
+            "https://mazeline.tech/ 에서 다운로드하세요.",
+        )
+    )
+    _checker.start()
+
     # Eagerly load the built-in model now so it's ready (and stays resident)
     # for the whole session. Done only on the real run — not in --selftest /
     # --screenshot — so those never trigger a multi-GB download/load.
