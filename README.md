@@ -2,70 +2,88 @@
 
 YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크다운(.md)** 파일로 저장하고, 선택적으로 **MP3 음원**도 추출하는 데스크톱 프로그램입니다. Qt 6(PySide6) 기반 GUI이며, **여러 영상을 동시에** 추출할 수 있습니다.
 
+![YouTube 자막 추출기 스크린샷](docs/screenshot.png)
+
 ## 주요 기능
 
-- 🎬 **다중 URL 입력** — 여러 줄로 붙여넣어 한 번에 목록에 추가
-- ⚡ **동시 추출** — `QThreadPool` 기반 병렬 처리 (동시 작업 수 1~16 조절)
-- 📝 **자막 → 마크다운** — 제목·URL·채널·언어·추출 시각 메타데이터 + 본문
-- 🎵 **MP3 음원 추출** — yt-dlp + 동봉 ffmpeg로 음원만 추출 (128 / 192 / 320 kbps)
-- 🌐 **언어 우선순위** — 예: `ko, en, ja` 순으로 자막 탐색, 수동 자막 우선/번역 폴백
-- 🕒 **타임스탬프 토글** — 타임스탬프 포함 또는 본문만 추출
-- 📊 **실시간 진행 표시** — 각 작업의 상태/진행/저장 파일을 표로 확인, 더블클릭으로 파일 열기
+- **다중 URL 입력** — 여러 줄로 붙여넣어 한 번에 목록에 추가
+- **동시 추출** — `QThreadPool` 기반 병렬 처리 (동시 작업 수 1~16 조절)
+- **자막 → 마크다운** — 제목·URL·채널·언어·추출 시각 메타데이터 + 본문
+- **포맷 선택** — 문장 단위 / 단락 단위 / 타임스탬프 포함 3가지 형식
+- **MP3 음원 추출** — yt-dlp + 동봉 ffmpeg로 음원만 추출 (128 / 192 / 320 kbps)
+- **언어 우선순위** — 예: `ko, en, ja` 순으로 자막 탐색, 수동 자막 우선/번역 폴백
+- **실시간 진행 표시** — 각 작업의 상태/진행/저장 파일을 표로 확인, 더블클릭으로 파일 열기
+- **스플래시 화면** — 앱 시작 시 3초간 로딩 화면 표시
+- **자동 업데이트 확인** — 시작 시 백그라운드로 최신 버전 확인
 
-자막과 MP3는 **각각 또는 함께** 선택해 추출할 수 있습니다.
+## AI 채팅
 
-지원하는 URL 형식: `watch?v=`, `youtu.be/`, `/shorts/`, `/embed/`, `/live/`, 그리고 11자리 영상 ID 직접 입력.
+우측 **AI 채팅** 패널로 추출한 자막을 요약·번역·질문할 수 있습니다.
 
-## 설치
+- **요약 탭** — 자막 핵심 내용을 한국어로 요약
+- **번역 탭** — 자막 전체를 한국어로 번역, 완료 시 자동으로 `.ko.md` 파일로 저장 (체크박스 옵션)
+- **기본 제공자** — 앱 내장 모델(**Gemma 4 E4B**, Apache-2.0), 첫 사용 시 Hugging Face에서 자동 다운로드(약 5.3GB), 이후 오프라인 동작
+- **GPU 가속** — NVIDIA·AMD·Intel GPU 감지 시 Vulkan으로 자동 가속 (CPU 대비 ~10~20배), 없으면 CPU 동작
+- **외부 API 연결** — OpenAI / Ollama / 로컬 서버 주소 직접 입력 가능
 
-```bash
-pip install -r requirements.txt
-```
+### llama-cpp-python 설치 (내장 모델 사용 시)
 
-- Python 3.10 이상 권장 (개발 환경: 3.12)
-
-### AI 채팅 (선택)
-
-우측 **AI 채팅** 패널로 추출한 자막을 요약·번역·질문할 수 있습니다. 기본 제공자는 **앱 내장 모델**로 **Gemma 4 E4B**(Apache-2.0)를 사용하며, 첫 사용 시 Hugging Face에서 모델(약 5.3GB)을 자동으로 내려받아 캐시합니다(이후 오프라인). 프로그램 시작 시 모델을 미리 로드(+워밍업)해 두며, **GPU(NVIDIA·AMD·Intel)가 있으면 Vulkan으로 자동 가속**(CPU 대비 약 10~20배)하고 없으면 CPU로 동작합니다(CPU는 RAM 약 6GB, GPU는 VRAM 약 6GB 사용). 내장 모델을 쓰려면 `llama-cpp-python`이 필요합니다(아래 참고).
-
-> ⚠️ **AVX512 주의**: abetlen의 사전빌드 CPU 휠(`--extra-index-url .../whl/cpu`)은 **AVX512로 컴파일**돼 있어, AVX512가 없는 CPU(인텔 12~14세대 등 **대부분의 컨슈머 CPU 포함**)에서 모델 로드 시 `STATUS_ILLEGAL_INSTRUCTION (0xC000001D)`로 죽습니다. 배포용 빌드에는 사용하지 마세요. 대신 **AVX2로 소스 빌드**하세요(2013년 이후 거의 모든 CPU 호환):
+> **AVX512 주의**: 사전빌드 휠은 AVX512로 컴파일돼 있어 대부분의 컨슈머 CPU에서 죽습니다. 반드시 **AVX2 소스 빌드**하세요.
 
 ```bash
-# C++ 툴체인 필요 (Windows: MSVC + CMake/Ninja)
-# Windows (CP949 등 비 UTF-8 로캘에서 /utf-8 필수):
+# Windows (MSVC + CMake/Ninja 필요)
 set CMAKE_ARGS=-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DCMAKE_C_FLAGS=/utf-8 -DCMAKE_CXX_FLAGS=/utf-8
 pip install "llama-cpp-python>=0.3.0" --no-binary llama-cpp-python --no-cache-dir
 ```
 
-내장 모델 없이도, 채팅 패널의 **제공자**를 OpenAI·Ollama·SGLang/vLLM·직접 입력으로 바꿔 본인 계정/로컬 서버로 쓸 수 있습니다(이 경우 위 추가 설치 불필요).
-
-## 실행
+## 설치 및 실행
 
 ```bash
+pip install -r requirements.txt
 python run.py
 ```
 
+Python 3.10 이상 필요.
+
 ## 릴리스 빌드 (Windows 실행파일)
 
-PyInstaller로 단일 실행파일(`.exe`)을 만듭니다. ffmpeg 바이너리·배너 이미지·yt-dlp 추출기 모듈이 모두 포함되어 **별도 설치 없이** 실행됩니다.
+PyInstaller로 폴더 형태 빌드를 만든 뒤 ZIP으로 배포합니다.
 
 ```bash
 pip install pyinstaller
 pyinstaller --noconfirm --clean YouTubeTranscriptExtractor.spec
+# 결과: dist/YouTubeTranscriptExtractor/ 폴더
 ```
 
-- 결과물: `dist/YouTubeTranscriptExtractor.exe` (콘솔 창 없는 GUI 단일 파일)
-- 빌드 검증: `dist/YouTubeTranscriptExtractor.exe --selftest` (정상 시 종료 코드 0)
+빌드 검증:
+```bash
+dist\YouTubeTranscriptExtractor\YouTubeTranscriptExtractor.exe --selftest
+```
+
+## 배포 (FTP)
+
+`ftp-config.example.json`을 복사해 `ftp-config.json`을 만들고 비밀번호를 채운 뒤:
+
+```bash
+python scripts/deploy.py            # 빌드 zip + 매니페스트 + 업로드
+python scripts/deploy.py --check    # FTP 연결 테스트만
+python scripts/deploy.py --dry-run  # 업로드 없이 목록 확인
+```
+
+업로드 대상: `mazeline.tech/updates/youtubeTranscriptExtractor/`
 
 ## 사용법
 
 1. 상단 입력란에 YouTube URL을 한 줄에 하나씩 붙여넣고 **목록에 추가**를 누릅니다.
-2. **옵션**에서 저장 폴더, 선호 언어, 동시 작업 수, 타임스탬프 포함 여부를 설정합니다.
-3. **추출 항목**에서 `자막 (.md)` / `MP3 음원`을 선택합니다(둘 다 가능). MP3는 음질을 고를 수 있습니다.
-4. **추출 시작**을 누르면 대기 중인 모든 항목이 병렬로 처리됩니다.
-5. 표의 항목을 더블클릭하면 저장된 파일이 열립니다.
+2. **옵션**에서 저장 폴더, 선호 언어, 동시 작업 수를 설정합니다.
+3. **포맷 카드**에서 문장 단위 / 단락 단위 / 타임스탬프 중 하나를 선택합니다.
+4. **추출 항목**에서 `자막 (.md)` / `MP3 음원`을 선택합니다(둘 다 가능).
+5. **한국어 번역도 함께 저장** 체크 시, AI 번역 완료 후 `.ko.md` 파일이 자동 저장됩니다.
+6. **추출 시작**을 누르면 병렬 처리가 시작됩니다.
+7. 표의 항목을 더블클릭하면 저장된 파일이 열립니다.
+8. 추출 완료 후 우측 패널에서 **AI로 요약** 또는 **AI로 번역**을 눌러 AI 기능을 사용합니다.
 
-> **ffmpeg 안내**: MP3 변환에는 ffmpeg가 필요합니다. `imageio-ffmpeg`가 ffmpeg 바이너리를 함께 제공하므로 별도 설치 없이 동작합니다. 시스템에 ffmpeg가 설치돼 있으면 그것도 사용할 수 있습니다.
+> **ffmpeg 안내**: MP3 변환에는 ffmpeg가 필요합니다. `imageio-ffmpeg`가 ffmpeg 바이너리를 함께 제공하므로 별도 설치 없이 동작합니다.
 
 기본 저장 위치는 실행 폴더의 `transcripts/` 입니다.
 
@@ -84,28 +102,39 @@ pyinstaller --noconfirm --clean YouTubeTranscriptExtractor.spec
 
 ## Transcript
 
-`[0:00]` 안녕하세요, 오늘은…
-`[0:04]` 다음 주제로 넘어가서…
+안녕하세요, 오늘은 유니티에서 캐릭터를 추가하는 방법에 대해 알아보겠습니다.
 ```
 
 ## 프로젝트 구조
 
 ```
 YOUTUBE-SCRIPT-EXTRACTOR/
-├── run.py                  # 실행 진입점
+├── run.py                        # 실행 진입점
 ├── requirements.txt
-├── yt_extractor/
-│   ├── __init__.py
-│   ├── core.py             # 추출 로직 (URL 파싱·자막·MP3·마크다운) — GUI 비의존
-│   ├── app.py              # PySide6 (Qt 6) GUI
-│   └── img/
-│       └── mazelinebanner.jpg   # 하단 광고 배너 이미지
-└── README.md
+├── YouTubeTranscriptExtractor.spec   # PyInstaller 빌드 스펙
+├── scripts/
+│   └── deploy.py                 # 빌드 ZIP 패킹 + FTP 배포
+├── ftp-config.example.json       # FTP 설정 템플릿
+└── yt_extractor/
+    ├── __init__.py               # 버전 정보
+    ├── app.py                    # PySide6 (Qt 6) GUI 메인
+    ├── core.py                   # 추출 로직 (URL 파싱·자막·MP3·마크다운)
+    ├── chat_render.py            # AI 채팅 HTML 렌더러
+    ├── local_llm.py              # 내장 llama-cpp-python LLM 래퍼
+    ├── splash.py                 # 스플래시 화면
+    ├── updater.py                # 업데이트 확인 (백그라운드 QThread)
+    └── img/
+        └── mazelinebanner.jpg
 ```
 
-`core.py`는 GUI에 의존하지 않으므로 CLI 등 다른 프론트엔드에서도 재사용할 수 있습니다. 하단 배너는 [MazeLine](https://mazeline.tech/)으로 연결됩니다.
+`core.py`는 GUI에 의존하지 않으므로 CLI 등 다른 프론트엔드에서도 재사용할 수 있습니다.
 
 ## 참고
 
 - 자막은 YouTube가 제공하는 경우에만 추출됩니다. 자막이 비활성화된 영상은 추출할 수 없습니다.
 - 짧은 시간에 많은 요청을 보내면 YouTube가 일시적으로 IP를 제한할 수 있습니다. 이 경우 동시 작업 수를 줄이세요.
+- 내장 AI 모델(Gemma 4 E4B)은 처음 실행 시 약 5.3GB를 다운로드합니다. 이후에는 오프라인으로 동작합니다.
+
+---
+
+[MazeLine](https://mazeline.tech/) — 게임 개발의 새로운 기준
