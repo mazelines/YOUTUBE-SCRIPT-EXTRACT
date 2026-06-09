@@ -49,17 +49,17 @@ def _md_to_html(text: str) -> str:
 # ``.turn`` classes so they don't fight QTextDocument's defaults elsewhere.
 _DOC_STYLE = """
 <style>
-  body { font-family: 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
-         font-size: 13px; color: #222; background: #f6f6f6; }
-  .turn { padding: 10px 14px; margin: 6px 0; }
-  .turn-user { background: #eef5ff; border-left: 3px solid #1769aa; }
-  .turn-ai   { background: #f6f6f6; border-left: 3px solid #1b7f3b; }
-  .turn-err  { background: #fdecea; border-left: 3px solid #b00020; color: #7a0014; }
-  .role      { font-weight: bold; margin-bottom: 4px; }
-  .role-user { color: #1769aa; }
-  .role-ai   { color: #1b7f3b; }
-  .role-err  { color: #b00020; }
-  .body      { line-height: 1.5; }
+  body { font-family: 'Gothic A1', 'Apple SD Gothic Neo', 'Malgun Gothic', system-ui, sans-serif;
+         font-size: 13.5px; color: #2a2622; background: #efe8da; }
+  .turn { padding: 10px 14px; margin: 8px 0; border-radius: 16px; }
+  .turn-user { background: #2a2622; color: #ffffff; margin-left: 40px; }
+  .turn-ai   { background: transparent; color: #1a1410; margin-right: 40px; }
+  .turn-err  { background: #fde6de; border-left: 3px solid #e85d3e; color: #7a0014; }
+  .role      { font-weight: bold; margin-bottom: 4px; font-size: 11px; letter-spacing: 0.04em; }
+  .role-user { color: #b6b0a0; }
+  .role-ai   { color: #7f8a3f; }
+  .role-err  { color: #e85d3e; }
+  .body      { line-height: 1.62; }
   .body p    { margin: 4px 0; }
   .body h1, .body h2, .body h3, .body h4 { margin: 10px 0 4px; }
   .body h1   { font-size: 18px; }
@@ -68,16 +68,16 @@ _DOC_STYLE = """
   .body ul, .body ol { margin: 4px 0 4px 20px; }
   .body li   { margin: 2px 0; }
   .body blockquote { margin: 6px 0; padding: 4px 10px;
-                     background: #eef2f7; border-left: 3px solid #99a; color: #444; }
-  .body code { background: #e9ecef; padding: 0 3px;
-               font-family: 'Consolas', 'Menlo', 'D2Coding', monospace; }
-  .body pre  { background: #1e1e1e; color: #dcdcdc; padding: 10px;
-               font-family: 'Consolas', 'Menlo', 'D2Coding', monospace; }
+                     background: #f6f2ea; border-left: 3px solid #b3cf4e; color: #575451; }
+  .body code { background: #ece5d8; padding: 0 3px;
+               font-family: 'JetBrains Mono', 'Consolas', 'Menlo', monospace; font-size: 12.5px; }
+  .body pre  { background: #1e1e1e; color: #dcdcdc; padding: 10px; border-radius: 8px;
+               font-family: 'JetBrains Mono', 'Consolas', 'Menlo', monospace; }
   .body pre code { background: transparent; padding: 0; }
   .body table { border-collapse: collapse; margin: 6px 0; }
-  .body th, .body td { border: 1px solid #ccc; padding: 4px 8px; }
-  .body th   { background: #eee; }
-  .cursor    { color: #888; }
+  .body th, .body td { border: 1px solid #ece5d8; padding: 4px 8px; }
+  .body th   { background: #f6f2ea; }
+  .cursor    { color: #f47458; }
 </style>
 """
 
@@ -126,7 +126,7 @@ def render_conversation(turns, *, streaming: bool = False,
         role = t.get("role")
         text = t.get("content", "") or ""
         if role == "user":
-            parts.append(_render_user(text))
+            pass  # user prompt is a system instruction — don't display it
         elif role == "assistant":
             tail = streaming and (i == len(turns) - 1)
             parts.append(_render_assistant(text, tail))
