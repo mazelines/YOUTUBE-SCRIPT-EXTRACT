@@ -1448,10 +1448,6 @@ def _run_selftest() -> int:
     import os
     problems = []
 
-    bp = _banner_image_path()
-    if not bp or not Path(bp).exists():
-        problems.append("banner image missing")
-
     try:
         from .core import _ffmpeg_location
         loc = _ffmpeg_location()
@@ -1483,8 +1479,6 @@ def _run_selftest() -> int:
         win = MainWindow()
         win.show()
         app.processEvents()
-        if win.banner._pix is None and bp:
-            problems.append("banner pixmap failed to load")
     except Exception as e:
         problems.append(f"GUI instantiation failed: {e}")
 

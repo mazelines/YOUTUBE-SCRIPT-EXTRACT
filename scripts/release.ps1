@@ -1,20 +1,20 @@
-# Release pipeline: clean -> build -> selftest -> publish to Google Drive.
+# Release pipeline: clean -> build -> selftest -> zip -> publish to Google Drive.
 #
 # The Drive folder is mounted locally by Google Drive Desktop, so "upload" is
 # just a Copy-Item — no API, no auth. Override the target with -DriveDir if
 # the user has Drive mounted on a different letter.
 #
 # Usage:
-#   .\scripts\release.ps1                    # clean build, copy as latest
+#   .\scripts\release.ps1                    # clean build, zip, copy as latest
 #   .\scripts\release.ps1 -Versioned         # also drop a timestamped archive
-#   .\scripts\release.ps1 -SkipBuild         # just re-copy the existing dist/
+#   .\scripts\release.ps1 -SkipBuild         # just re-zip and re-copy the existing dist/
 #   .\scripts\release.ps1 -DriveDir 'X:\...' # override Drive target
 
 [CmdletBinding()]
 param(
-    [string]$DriveDir = 'I:\GoogleDireve\PublicShare\YoutubeExtractor',
-    [string]$ExeName  = 'YouTubeTranscriptExtractor.exe',
-    [string]$SpecFile = 'YouTubeTranscriptExtractor.spec',
+    [string]$DriveDir   = 'I:\GoogleDireve\PublicShare\YoutubeExtractor',
+    [string]$AppName    = 'YouTubeTranscriptExtractor',
+    [string]$SpecFile   = 'YouTubeTranscriptExtractor.spec',
     [switch]$Versioned,
     [switch]$SkipBuild,
     [switch]$SkipSelftest
@@ -36,7 +36,7 @@ if (-not $SkipBuild) {
     }
 }
 
-# --- 2) PyInstaller build ----------------------------------------------------
+# --- 2) PyInstaller build (onedir) -------------------------------------------
 if (-not $SkipBuild) {
     Write-Step "PyInstaller $SpecFile"
     & pyinstaller $SpecFile --noconfirm --log-level WARN
@@ -46,16 +46,19 @@ if (-not $SkipBuild) {
     }
 }
 
-$exePath = Join-Path $projectRoot "dist\$ExeName"
+# The real exe lives inside the onedir bundle folder.
+$bundleDir = Join-Path $projectRoot "dist\$AppName"
+$exePath   = Join-Path $bundleDir "$AppName.exe"
 if (-not (Test-Path $exePath)) {
     Write-Fail "Built exe not found: $exePath"
     exit 1
 }
 
-$size = (Get-Item $exePath).Length
-Write-Ok ("Built: {0} ({1:N1} MB)" -f $exePath, ($size / 1MB))
+$exeSize = (Get-Item $exePath).Length
+$dirSize = (Get-ChildItem $bundleDir -Recurse | Measure-Object -Property Length -Sum).Sum
+Write-Ok ("Bundle: {0} ({1:N1} MB total, exe stub {2:N1} MB)" -f $bundleDir, ($dirSize / 1MB), ($exeSize / 1MB))
 
-# --- 3) Selftest the built exe ----------------------------------------------
+# --- 3) Selftest the built exe -----------------------------------------------
 if (-not $SkipSelftest) {
     Write-Step 'Running --selftest against the built exe'
     $selftestOut = Join-Path $projectRoot '_selftest_release.txt'
@@ -77,27 +80,34 @@ if (-not $SkipSelftest) {
     Write-Ok 'Selftest passed'
 }
 
-# --- 4) Publish to Google Drive (local mount) --------------------------------
+# --- 4) Zip the bundle folder ------------------------------------------------
+$zipName = "$AppName.zip"
+$zipPath = Join-Path $projectRoot "dist\$zipName"
+Write-Step "Zipping bundle -> $zipPath"
+if (Test-Path $zipPath) { Remove-Item $zipPath }
+Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath
+$zipSize = (Get-Item $zipPath).Length
+Write-Ok ("Zip: {0} ({1:N1} MB)" -f $zipPath, ($zipSize / 1MB))
+
+# --- 5) Publish to Google Drive (local mount) --------------------------------
 if (-not (Test-Path $DriveDir)) {
     Write-Fail "Drive target missing: $DriveDir (is Google Drive Desktop running?)"
     exit 1
 }
 
 Write-Step "Copying to $DriveDir"
-Copy-Item -Path $exePath -Destination (Join-Path $DriveDir $ExeName) -Force
-Write-Ok "Published: $DriveDir\$ExeName"
+Copy-Item -Path $zipPath -Destination (Join-Path $DriveDir $zipName) -Force
+Write-Ok "Published: $DriveDir\$zipName"
 
 if ($Versioned) {
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
-    $stem  = [System.IO.Path]::GetFileNameWithoutExtension($ExeName)
-    $ext   = [System.IO.Path]::GetExtension($ExeName)
-    $archive = "${stem}-${stamp}${ext}"
-    Copy-Item -Path $exePath -Destination (Join-Path $DriveDir $archive) -Force
+    $stamp   = Get-Date -Format 'yyyyMMdd-HHmm'
+    $archive = "$AppName-$stamp.zip"
+    Copy-Item -Path $zipPath -Destination (Join-Path $DriveDir $archive) -Force
     Write-Ok "Archived: $DriveDir\$archive"
 }
 
-# --- 5) Report ---------------------------------------------------------------
-$driveItem = Get-Item (Join-Path $DriveDir $ExeName)
+# --- 6) Report ---------------------------------------------------------------
+$driveItem = Get-Item (Join-Path $DriveDir $zipName)
 Write-Host ''
 Write-Host '── Release published ─────────────────────────────────────────' -ForegroundColor Green
 Write-Host ("  File : {0}" -f $driveItem.FullName)
