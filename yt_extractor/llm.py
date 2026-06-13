@@ -35,18 +35,21 @@ MAX_CONTEXT_CHARS = 12000
 
 
 def build_messages(user_text: str, history=None, transcripts=None,
-                   system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> list[dict]:
+                   system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+                   max_chars: int | None = MAX_CONTEXT_CHARS) -> list[dict]:
     """Assemble the OpenAI `messages` array for one turn.
 
     `history` is prior [{"role","content"}, ...] turns (user/assistant only).
     `transcripts` is an iterable of (name, text); each is appended to the system
     message as a labelled, length-capped block.
+    `max_chars` caps each transcript block (None = no limit, for external LLMs
+    with large context windows; built-in model uses MAX_CONTEXT_CHARS).
     """
     system = system_prompt
     for name, text in (transcripts or []):
         text = text or ""
-        if len(text) > MAX_CONTEXT_CHARS:
-            text = text[:MAX_CONTEXT_CHARS] + "\n…(이하 생략: 자막이 길어 일부만 포함됨)"
+        if max_chars is not None and len(text) > max_chars:
+            text = text[:max_chars] + "\n…(이하 생략: 자막이 길어 일부만 포함됨)"
         system += f"\n\n=== 자막: {name} ===\n{text}"
 
     messages = [{"role": "system", "content": system}]

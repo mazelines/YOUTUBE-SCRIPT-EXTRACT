@@ -36,7 +36,7 @@ from .core import (
     TRANSCRIPT_SENTENCES,
     TRANSCRIPT_PARAGRAPHS,
 )
-from .llm import build_messages, stream_chat, LLMError
+from .llm import build_messages, stream_chat, LLMError, MAX_CONTEXT_CHARS
 from .local_llm import (
     is_model_present, download_model, stream_local_chat, ensure_loaded,
     is_loaded,
@@ -513,7 +513,8 @@ class ChatTab(QWidget):
                 return
 
         messages = build_messages(text, history=self._history,
-                                  transcripts=panel._attached)
+                                  transcripts=panel._attached,
+                                  max_chars=None if not builtin else MAX_CONTEXT_CHARS)
         self._history.append({"role": "user", "content": text})
         # Empty in-flight assistant turn — _rerender() shows it as a bubble
         # with a streaming cursor until tokens fill it in.
