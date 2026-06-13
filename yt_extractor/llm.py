@@ -27,6 +27,36 @@ DEFAULT_SYSTEM_PROMPT = (
     "사실만으로 답하고 근거가 없으면 모른다고 말하세요."
 )
 
+# Strict, translation-only persona for the chunked translation path. The
+# general prompt above lets the model editorialize — it was observed adding
+# titles ("## 번역"), prefaces ("다음은 번역입니다…"), and even self-generated
+# Q&A after each chunk, which then leaked into the joined result. This one
+# constrains it to emit ONLY the translated text so chunks concatenate cleanly.
+TRANSLATE_SYSTEM_PROMPT = (
+    "당신은 정확한 번역기입니다. 사용자가 보낸 텍스트를 자연스러운 한국어로 "
+    "번역한 결과만 출력하세요. 제목, 머리말, 인사말, 설명, 요약, 질문과 답변, "
+    "구분선 등 번역문 이외의 내용은 절대 추가하지 마세요. 이미 한국어인 부분은 "
+    "그대로 두고, 번역된 본문만 응답하세요."
+)
+
+# Marker that separates the .md metadata header from the actual caption body
+# (see core.build_markdown). Translation should only touch the body.
+_TRANSCRIPT_MARKER = "## Transcript"
+
+
+def transcript_body(text: str) -> str:
+    """Return just the caption body of an extracted .md, dropping the header.
+
+    The metadata header (title, URL, extraction time) isn't worth translating
+    and confuses the model (it replies "nothing to translate" for a header-only
+    chunk). Everything after the ``## Transcript`` marker is the body; if the
+    marker is absent (e.g. raw pasted text) the input is returned unchanged.
+    """
+    idx = text.find(_TRANSCRIPT_MARKER)
+    if idx == -1:
+        return text
+    return text[idx + len(_TRANSCRIPT_MARKER):].lstrip("\n")
+
 # Cap attached transcript text so a long video can't overflow the prompt; the
 # excess is dropped with a visible "…생략" marker in the system message. Keep
 # this in sync with the built-in model's n_ctx (local_llm._get_llm): for Korean
@@ -40,28 +70,64 @@ MAX_CONTEXT_CHARS = 12000
 TRANSLATE_CHUNK_CHARS = 4000
 
 
+def _wrap_long_line(line: str, max_chars: int) -> list[str]:
+    """Break a single over-cap line into pieces no longer than ``max_chars``.
+
+    Prefers word (whitespace) boundaries; a single word longer than the cap
+    (e.g. spaceless CJK auto-captions) is sliced at character boundaries. This
+    guarantees the cap even when a transcript is one long punctuation-less line.
+    """
+    pieces: list[str] = []
+    current = ""
+    for word in line.split(" "):
+        if len(word) > max_chars:
+            if current:
+                pieces.append(current)
+                current = ""
+            for i in range(0, len(word), max_chars):
+                pieces.append(word[i:i + max_chars])
+            continue
+        candidate = f"{current} {word}" if current else word
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            pieces.append(current)
+            current = word
+    if current:
+        pieces.append(current)
+    return pieces
+
+
 def split_for_translation(text: str,
                           max_chars: int = TRANSLATE_CHUNK_CHARS) -> list[str]:
-    """Split transcript text into translation chunks at line boundaries.
+    """Split transcript text into translation chunks, each no longer than ``max_chars``.
 
     Accumulates whole lines until adding the next would exceed ``max_chars``,
     then starts a new chunk — so a sentence/line is never cut mid-way (the
-    transcript .md is already line-broken per sentence/paragraph). A single
-    line longer than ``max_chars`` becomes its own oversized chunk rather than
-    being split. Returns ``[]`` for empty or whitespace-only input.
+    transcript .md is normally line-broken per sentence/paragraph). A single
+    line longer than the cap (auto-captions can be one giant punctuation-less
+    line) is broken further at word, then character, boundaries via
+    ``_wrap_long_line`` so every chunk fits the model's context window. Returns
+    ``[]`` for empty or whitespace-only input.
     """
     if not text or not text.strip():
         return []
     chunks: list[str] = []
     current = ""
     for line in text.split("\n"):
+        if len(line) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_wrap_long_line(line, max_chars))
+            continue
         candidate = f"{current}\n{line}" if current else line
         if len(candidate) <= max_chars:
             current = candidate
         else:
             if current:
                 chunks.append(current)
-            current = line  # may itself exceed max_chars; kept whole anyway
+            current = line
     if current:
         chunks.append(current)
     return chunks
