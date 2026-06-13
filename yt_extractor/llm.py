@@ -33,6 +33,39 @@ DEFAULT_SYSTEM_PROMPT = (
 # ~1 char ≈ 1 token, so 12000 chars ≈ 12k tokens, which must fit under n_ctx.
 MAX_CONTEXT_CHARS = 12000
 
+# Per-chunk input size for the built-in model's chunked translation. Translation
+# needs room for BOTH the input and a similar-length output under n_ctx=16384, so
+# this is kept well below MAX_CONTEXT_CHARS: ~4000 input chars + ~4000+ output +
+# system prompt all fit comfortably with margin.
+TRANSLATE_CHUNK_CHARS = 4000
+
+
+def split_for_translation(text: str,
+                          max_chars: int = TRANSLATE_CHUNK_CHARS) -> list[str]:
+    """Split transcript text into translation chunks at line boundaries.
+
+    Accumulates whole lines until adding the next would exceed ``max_chars``,
+    then starts a new chunk — so a sentence/line is never cut mid-way (the
+    transcript .md is already line-broken per sentence/paragraph). A single
+    line longer than ``max_chars`` becomes its own oversized chunk rather than
+    being split. Returns ``[]`` for empty or whitespace-only input.
+    """
+    if not text or not text.strip():
+        return []
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = line  # may itself exceed max_chars; kept whole anyway
+    if current:
+        chunks.append(current)
+    return chunks
+
 
 def build_messages(user_text: str, history=None, transcripts=None,
                    system_prompt: str = DEFAULT_SYSTEM_PROMPT,

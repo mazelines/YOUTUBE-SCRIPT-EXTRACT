@@ -36,7 +36,10 @@ from .core import (
     TRANSCRIPT_SENTENCES,
     TRANSCRIPT_PARAGRAPHS,
 )
-from .llm import build_messages, stream_chat, LLMError, MAX_CONTEXT_CHARS
+from .llm import (
+    build_messages, stream_chat, LLMError, MAX_CONTEXT_CHARS,
+    split_for_translation,
+)
 from .local_llm import (
     is_model_present, download_model, stream_local_chat, ensure_loaded,
     is_loaded,
@@ -229,11 +232,21 @@ class BuiltinWorker(QRunnable):
     On first use the model isn't on disk, so this downloads it (reporting
     progress) before loading and streaming. Cancellation aborts the download or
     the generation, whichever is in flight.
+
+    Two modes:
+      - single request: pass `messages` (the usual chat-completion array).
+      - chunked translation: pass `chunks` (a list of transcript pieces) and
+        `instruction`; each chunk is translated as an independent request and
+        the results are streamed back as one continuous answer. Used so a long
+        transcript can be fully translated within the model's n_ctx instead of
+        being truncated. See llm.split_for_translation.
     """
 
-    def __init__(self, messages):
+    def __init__(self, messages=None, *, chunks=None, instruction=""):
         super().__init__()
         self.messages = messages
+        self.chunks = chunks
+        self.instruction = instruction
         self.signals = BuiltinSignals()
         self._cancel = threading.Event()
 
@@ -258,11 +271,14 @@ class BuiltinWorker(QRunnable):
                 self.signals.status.emit("AI가 처리 중…")
             else:
                 self.signals.status.emit("모델 로딩 중… (최초 1회는 시간이 걸립니다)")
-            stream_local_chat(
-                self.messages,
-                on_token=lambda t: self.signals.token.emit(t),
-                should_cancel=self._cancel.is_set,
-            )
+            if self.chunks is not None:
+                self._run_chunked()
+            else:
+                stream_local_chat(
+                    self.messages,
+                    on_token=lambda t: self.signals.token.emit(t),
+                    should_cancel=self._cancel.is_set,
+                )
         except LLMError as e:
             self.signals.error.emit(str(e))
             return
@@ -270,6 +286,27 @@ class BuiltinWorker(QRunnable):
             self.signals.error.emit(f"예기치 못한 오류: {e}")
             return
         self.signals.done.emit()
+
+    def _run_chunked(self):
+        """Translate each chunk as its own request, streamed as one answer.
+
+        A short status note ("번역 중… (i/total)") is emitted at each chunk
+        boundary so the user sees progress through a long translation; chunks
+        are joined with a blank line so the result reads as one document.
+        """
+        total = len(self.chunks)
+        for i, chunk in enumerate(self.chunks, 1):
+            if self._cancel.is_set():
+                break
+            self.signals.status.emit(f"번역 중… ({i}/{total})")
+            messages = build_messages(f"{self.instruction}\n\n{chunk}")
+            stream_local_chat(
+                messages,
+                on_token=lambda t: self.signals.token.emit(t),
+                should_cancel=self._cancel.is_set,
+            )
+            if i < total and not self._cancel.is_set():
+                self.signals.token.emit("\n\n")
 
 
 class PreloadWorker(QRunnable):
@@ -512,6 +549,19 @@ class ChatTab(QWidget):
                 )
                 return
 
+        # Built-in model + translate tab: a long transcript would overflow the
+        # model's n_ctx and get truncated, so split it into chunks translated
+        # one after another and streamed back as a single answer. Short
+        # transcripts (a single chunk) fall through to the normal single
+        # request. External LLMs never chunk — they get the full text uncapped.
+        is_translate = self is panel.translate_tab
+        chunks = None
+        if builtin and is_translate and panel._attached:
+            full = "\n\n".join(t for _, t in panel._attached if t)
+            split = split_for_translation(full)
+            if len(split) > 1:
+                chunks = split
+
         messages = build_messages(text, history=self._history,
                                   transcripts=panel._attached,
                                   max_chars=None if not builtin else MAX_CONTEXT_CHARS)
@@ -524,7 +574,11 @@ class ChatTab(QWidget):
         self._rerender()
 
         if builtin:
-            worker = BuiltinWorker(messages)
+            if chunks is not None:
+                instruction = self.manual_instruction or text
+                worker = BuiltinWorker(chunks=chunks, instruction=instruction)
+            else:
+                worker = BuiltinWorker(messages)
             worker.signals.status.connect(panel._on_builtin_status)
             worker.signals.progress.connect(panel._on_builtin_progress)
         else:
