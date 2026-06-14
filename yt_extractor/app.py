@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import subprocess
 import threading
 from pathlib import Path
@@ -36,7 +37,10 @@ from .core import (
     TRANSCRIPT_SENTENCES,
     TRANSCRIPT_PARAGRAPHS,
 )
-from .llm import build_messages, stream_chat, LLMError
+from .llm import (
+    build_messages, LLMError, MAX_CONTEXT_CHARS,
+    split_for_translation, transcript_body, TRANSLATE_SYSTEM_PROMPT,
+)
 from .local_llm import (
     is_model_present, download_model, stream_local_chat, ensure_loaded,
     is_loaded,
@@ -169,55 +173,12 @@ class ExtractWorker(QRunnable):
         self.signals.finished.emit(row, {"files": files, "errors": errors})
 
 
-class ChatSignals(QObject):
-    """Signals emitted by a ChatWorker, marshalled to the GUI thread."""
-
-    token = Signal(str)      # one streamed text delta
-    done = Signal()          # stream completed normally
-    error = Signal(str)      # user-facing failure message
-
-
-class ChatWorker(QRunnable):
-    """Stream one LLM chat completion off the GUI thread.
-
-    Mirrors ExtractWorker: native/blocking work runs here and reaches the UI
-    only through signals. Cancellation is cooperative via an Event.
-    """
-
-    def __init__(self, messages, base_url: str, model: str, api_key: str):
-        super().__init__()
-        self.messages = messages
-        self.base_url = base_url
-        self.model = model
-        self.api_key = api_key
-        self.signals = ChatSignals()
-        self._cancel = threading.Event()
-
-    def cancel(self):
-        self._cancel.set()
-
-    @Slot()
-    def run(self):
-        try:
-            stream_chat(
-                self.messages, self.base_url, self.model, api_key=self.api_key,
-                on_token=lambda t: self.signals.token.emit(t),
-                should_cancel=self._cancel.is_set,
-            )
-        except LLMError as e:
-            self.signals.error.emit(str(e))
-            return
-        except Exception as e:  # pragma: no cover - defensive
-            self.signals.error.emit(f"예기치 못한 오류: {e}")
-            return
-        self.signals.done.emit()
-
-
 class BuiltinSignals(QObject):
     """Signals for the bundled CPU model worker (download + inference)."""
 
     status = Signal(str)          # high-level phase, e.g. "모델 로딩 중…"
     progress = Signal(int, int)   # downloaded, total bytes (first-run download)
+    chunk = Signal(int, int)      # current, total chunks (chunked translation)
     token = Signal(str)           # streamed text delta
     done = Signal()
     error = Signal(str)
@@ -229,11 +190,21 @@ class BuiltinWorker(QRunnable):
     On first use the model isn't on disk, so this downloads it (reporting
     progress) before loading and streaming. Cancellation aborts the download or
     the generation, whichever is in flight.
+
+    Two modes:
+      - single request: pass `messages` (the usual chat-completion array).
+      - chunked translation: pass `chunks` (a list of transcript pieces); each
+        is translated as an independent request under the strict
+        TRANSLATE_SYSTEM_PROMPT and the results are streamed back as one
+        continuous answer. Used so a long transcript can be fully translated
+        within the model's n_ctx instead of being truncated. See
+        llm.split_for_translation.
     """
 
-    def __init__(self, messages):
+    def __init__(self, messages=None, *, chunks=None):
         super().__init__()
         self.messages = messages
+        self.chunks = chunks
         self.signals = BuiltinSignals()
         self._cancel = threading.Event()
 
@@ -258,11 +229,14 @@ class BuiltinWorker(QRunnable):
                 self.signals.status.emit("AI가 처리 중…")
             else:
                 self.signals.status.emit("모델 로딩 중… (최초 1회는 시간이 걸립니다)")
-            stream_local_chat(
-                self.messages,
-                on_token=lambda t: self.signals.token.emit(t),
-                should_cancel=self._cancel.is_set,
-            )
+            if self.chunks is not None:
+                self._run_chunked()
+            else:
+                stream_local_chat(
+                    self.messages,
+                    on_token=lambda t: self.signals.token.emit(t),
+                    should_cancel=self._cancel.is_set,
+                )
         except LLMError as e:
             self.signals.error.emit(str(e))
             return
@@ -270,6 +244,27 @@ class BuiltinWorker(QRunnable):
             self.signals.error.emit(f"예기치 못한 오류: {e}")
             return
         self.signals.done.emit()
+
+    def _run_chunked(self):
+        """Translate each chunk as its own request, streamed as one answer.
+
+        A short status note ("번역 중… (i/total)") is emitted at each chunk
+        boundary so the user sees progress through a long translation; chunks
+        are joined with a blank line so the result reads as one document.
+        """
+        total = len(self.chunks)
+        for i, chunk in enumerate(self.chunks, 1):
+            if self._cancel.is_set():
+                break
+            self.signals.chunk.emit(i, total)
+            messages = build_messages(chunk, system_prompt=TRANSLATE_SYSTEM_PROMPT)
+            stream_local_chat(
+                messages,
+                on_token=lambda t: self.signals.token.emit(t),
+                should_cancel=self._cancel.is_set,
+            )
+            if i < total and not self._cancel.is_set():
+                self.signals.token.emit("\n\n")
 
 
 class PreloadWorker(QRunnable):
@@ -394,6 +389,9 @@ class BannerWidget(QFrame):
 SUMMARY_PROMPT = "첨부된 자막을 핵심 위주로 한국어로 요약해 주세요."
 TRANSLATE_PROMPT = "첨부된 자막을 자연스러운 한국어로 번역해 주세요."
 
+# Braille spinner frames for the in-progress indicator.
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
 
 class ChatTab(QWidget):
     """One conversation strand (요약 or 번역) inside a parent ChatPanel.
@@ -411,7 +409,7 @@ class ChatTab(QWidget):
         self.quick_prompt = quick_prompt
         self.manual_instruction = manual_instruction
         self._history: list[dict] = []
-        self._worker: ChatWorker | BuiltinWorker | None = None
+        self._worker: BuiltinWorker | None = None
         self._streaming_assistant: str | None = None
         self._last_error: str | None = None
         # Coalesce stream-driven re-renders (~80 ms) so a fast model doesn't
@@ -419,9 +417,32 @@ class ChatTab(QWidget):
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._rerender)
+        # Spinner + elapsed clock for the in-progress indicator.
+        self._spin_i = 0
+        self._start_ts = 0.0
+        self._status_base = ""
+        self._spin_timer = QTimer(self)
+        self._spin_timer.timeout.connect(self._tick_progress)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 6, 0, 0)
+
+        # Agent-style progress: a spinner+status line over a progress bar,
+        # pinned above the chat view and shown only while a response is in
+        # flight. For chunked translation the bar is determinate (i/total);
+        # for single-request work (summary, external LLM) it stays marquee.
+        self._prog_label = QLabel("")
+        self._prog_label.setStyleSheet("color: #1769aa; font-size: 11px;")
+        self._prog_bar = QProgressBar()
+        self._prog_bar.setTextVisible(True)
+        self._prog_box = QWidget()
+        prog_lay = QVBoxLayout(self._prog_box)
+        prog_lay.setContentsMargins(0, 0, 0, 4)
+        prog_lay.setSpacing(2)
+        prog_lay.addWidget(self._prog_label)
+        prog_lay.addWidget(self._prog_bar)
+        self._prog_box.setVisible(False)
+        lay.addWidget(self._prog_box)
 
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
@@ -495,25 +516,20 @@ class ChatTab(QWidget):
                                     "현재 답변이 끝난 뒤 보내주세요.")
             return
         panel = self.panel
-        builtin = (panel.provider.currentText() == panel.BUILTIN_PROVIDER)
-        if not builtin:
-            base_url = panel.base_url.text().strip()
-            model = panel.model.text().strip()
-            if not base_url or not model:
-                QMessageBox.information(
-                    self, "설정 필요", "AI 서비스 주소와 모델 이름을 입력하세요."
-                )
-                return
-            if not panel.api_key.text().strip() and not panel._is_local(base_url):
-                QMessageBox.information(
-                    self, "API 키 필요",
-                    "이 서비스는 API 키가 필요합니다. 위 'AI 서비스' 설정에서 "
-                    "키를 입력하세요.",
-                )
-                return
+        # Translate tab: translate the transcript body (header metadata
+        # excluded) under the strict translation-only prompt, split into chunks
+        # so a long video can't overflow the model's n_ctx and get truncated.
+        # The results stream back as one continuous answer. A short transcript
+        # is just a single chunk through the same path, so behaviour is uniform.
+        is_translate = self is panel.translate_tab
+        chunks = None
+        if is_translate and panel._attached:
+            body = transcript_body("\n\n".join(t for _, t in panel._attached if t))
+            chunks = split_for_translation(body) or None
 
         messages = build_messages(text, history=self._history,
-                                  transcripts=panel._attached)
+                                  transcripts=panel._attached,
+                                  max_chars=MAX_CONTEXT_CHARS)
         self._history.append({"role": "user", "content": text})
         # Empty in-flight assistant turn — _rerender() shows it as a bubble
         # with a streaming cursor until tokens fill it in.
@@ -522,14 +538,11 @@ class ChatTab(QWidget):
         self._set_busy(True)
         self._rerender()
 
-        if builtin:
-            worker = BuiltinWorker(messages)
-            worker.signals.status.connect(panel._on_builtin_status)
-            worker.signals.progress.connect(panel._on_builtin_progress)
-        else:
-            worker = ChatWorker(messages, panel.base_url.text().strip(),
-                                panel.model.text().strip(),
-                                panel.api_key.text())
+        worker = (BuiltinWorker(chunks=chunks) if chunks is not None
+                  else BuiltinWorker(messages))
+        worker.signals.status.connect(panel._on_builtin_status)
+        worker.signals.progress.connect(panel._on_builtin_progress)
+        worker.signals.chunk.connect(self._on_chunk)
         worker.signals.token.connect(self._on_token)
         worker.signals.done.connect(self._on_done)
         worker.signals.error.connect(self._on_error)
@@ -588,11 +601,37 @@ class ChatTab(QWidget):
         self._set_busy(False)
         self._rerender()
 
+    def _tick_progress(self):
+        self._spin_i = (self._spin_i + 1) % len(_SPINNER)
+        el = int(time.monotonic() - self._start_ts)
+        self._prog_label.setText(
+            f"{_SPINNER[self._spin_i]} {self._status_base}  경과 {el // 60}:{el % 60:02d}"
+        )
+
+    @Slot(int, int)
+    def _on_chunk(self, i: int, total: int):
+        self._status_base = f"청크 {i}/{total} 번역 중…"
+        self._prog_bar.setRange(0, total)
+        self._prog_bar.setValue(i)
+        self._prog_bar.setFormat(f"{i}/{total}")
+
     def _set_busy(self, busy: bool):
         self.send_btn.setEnabled(not busy)
         self.quick_btn.setEnabled(not busy)
         self.reset_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
+        if busy:
+            self._status_base = "처리 중…"
+            self._start_ts = time.monotonic()
+            self._spin_i = 0
+            self._prog_bar.setRange(0, 0)   # marquee until chunk info arrives
+            self._prog_bar.setFormat("")
+            self._prog_box.setVisible(True)
+            self._tick_progress()
+            self._spin_timer.start(120)
+        else:
+            self._spin_timer.stop()
+            self._prog_box.setVisible(False)
 
     def _rerender(self):
         streaming = self._streaming_assistant is not None
@@ -604,48 +643,29 @@ class ChatTab(QWidget):
             turns, streaming=streaming, error=self._last_error,
         )
         sb = self.view.verticalScrollBar()
-        stick = sb.value() >= sb.maximum() - 8
-        self.view.setHtml(html_doc)
-        if stick:
-            sb.setValue(sb.maximum())
+        at_bottom = sb.value() >= sb.maximum() - 8
+        prev = sb.value()
+        self.view.setHtml(html_doc)        # setHtml resets scroll to the top
+        # Follow the newest text when pinned to the bottom; otherwise restore
+        # the user's place so they can read/scroll up mid-stream (without this,
+        # the per-token re-render yanks them back to the top every ~80 ms, which
+        # also makes manual scrolling impossible).
+        sb.setValue(sb.maximum() if at_bottom else min(prev, sb.maximum()))
 
 
 class ChatPanel(QWidget):
     """Right-side AI chat: summarize / translate / Q&A over transcripts.
 
-    Hosts two independent conversation tabs (요약 / 번역) that share the same
-    provider config and attached transcript. Each tab keeps its own history so
-    the two workflows don't pollute each other.
+    Hosts two independent conversation tabs (요약 / 번역) that share the
+    attached transcript. Each tab keeps its own history so the two workflows
+    don't pollute each other. Only the bundled in-process model is supported.
     """
-
-    # Provider presets. label -> (base_url, default model, needs_key, key_url).
-    # The built-in CPU model is the default so the app works with zero setup;
-    # users who have their own AI account can switch to a cloud/local provider.
-    BUILTIN_PROVIDER = "내장 모델 (GPU/CPU)"
-    PROVIDERS = {
-        BUILTIN_PROVIDER: ("", "", False, ""),
-        "OpenAI": (
-            "https://api.openai.com/v1", "gpt-4o-mini",
-            True, "https://platform.openai.com/api-keys",
-        ),
-        "로컬 Ollama": (
-            "http://localhost:11434/v1", "qwen2.5:1.5b", False, "",
-        ),
-        "로컬 SGLang · vLLM": (
-            "http://localhost:8000/v1", "Qwen/Qwen2.5-1.5B-Instruct", False, "",
-        ),
-        "직접 입력": ("", "", False, ""),
-    }
-    DEFAULT_PROVIDER = BUILTIN_PROVIDER
 
     def __init__(self, main_window: "MainWindow"):
         super().__init__()
         self.mw = main_window
-        # Dedicated pools keep AI work off the extraction pool. Remote chat must
-        # not queue behind the multi-GB built-in model preload, while built-in
-        # preload/inference stay serialized to avoid duplicate model loads.
-        self.chat_pool = QThreadPool()
-        self.chat_pool.setMaxThreadCount(1)
+        # Single pool keeps built-in preload/inference serialized so the
+        # multi-GB model is never loaded twice concurrently.
         self.model_pool = QThreadPool()
         self.model_pool.setMaxThreadCount(1)
         self._attached: list[tuple] = []       # (name, text) — shared by tabs
@@ -661,43 +681,18 @@ class ChatPanel(QWidget):
         title.setStyleSheet("font-weight: bold; font-size: 13px;")
         lay.addWidget(title)
 
-        # --- Endpoint config ---
-        cfg = QGroupBox("AI 서비스 (OpenAI 호환)")
-        cfg_grid = QGridLayout(cfg)
-        cfg_grid.setContentsMargins(8, 6, 8, 6)
-
-        cfg_grid.addWidget(QLabel("제공자:"), 0, 0)
-        self.provider = QComboBox()
-        self.provider.addItems(self.PROVIDERS.keys())
-        self.provider.currentTextChanged.connect(self._on_provider_changed)
-        cfg_grid.addWidget(self.provider, 0, 1, 1, 3)
-
-        cfg_grid.addWidget(QLabel("주소:"), 1, 0)
-        self.base_url = QLineEdit()
-        self.base_url.setToolTip("OpenAI 호환 엔드포인트의 베이스 URL")
-        cfg_grid.addWidget(self.base_url, 1, 1, 1, 3)
-
-        cfg_grid.addWidget(QLabel("모델:"), 2, 0)
-        self.model = QLineEdit()
-        self.model.setToolTip("서비스/서버에서 사용할 모델 이름")
-        cfg_grid.addWidget(self.model, 2, 1)
-        cfg_grid.addWidget(QLabel("API 키:"), 2, 2)
-        self.api_key = QLineEdit()
-        self.api_key.setPlaceholderText("로컬은 비워둠")
-        self.api_key.setEchoMode(QLineEdit.Password)
-        cfg_grid.addWidget(self.api_key, 2, 3)
-
-        # Hint with a clickable link to get a (free) key for the chosen service.
-        self.key_hint = QLabel()
-        self.key_hint.setOpenExternalLinks(True)
-        self.key_hint.setWordWrap(True)
-        self.key_hint.setStyleSheet("color: #7a7a7a; font-size: 11px;")
-        cfg_grid.addWidget(self.key_hint, 3, 0, 1, 4)
+        # --- Built-in model info (the only supported provider) ---
+        cfg = QGroupBox("AI 모델")
+        cfg_lay = QVBoxLayout(cfg)
+        cfg_lay.setContentsMargins(8, 6, 8, 6)
+        info = QLabel(
+            "앱 내장 모델을 사용합니다. GPU(NVIDIA·AMD·Intel)가 있으면 자동 "
+            "가속, 없으면 CPU로 동작합니다. 설정이 필요 없습니다."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #7a7a7a; font-size: 11px;")
+        cfg_lay.addWidget(info)
         lay.addWidget(cfg)
-
-        # Apply the default provider (built-in CPU model) to set field state.
-        self.provider.setCurrentText(self.DEFAULT_PROVIDER)
-        self._on_provider_changed(self.DEFAULT_PROVIDER)
 
         # --- Context indicator ---
         # Transcripts enter the conversation via the left pane's "AI로 요약" /
@@ -743,38 +738,6 @@ class ChatPanel(QWidget):
         self.tabs.addTab(self.summary_tab, "📝 요약")
         self.tabs.addTab(self.translate_tab, "🌐 번역")
         lay.addWidget(self.tabs, stretch=1)
-
-    # --------------------------------------------------------- provider ---
-    def _on_provider_changed(self, name: str):
-        cfg = self.PROVIDERS.get(name)
-        if not cfg:
-            return
-        base_url, model, needs_key, key_url = cfg
-        builtin = (name == self.BUILTIN_PROVIDER)
-        # The built-in model needs no endpoint config; grey those controls out.
-        for w in (self.base_url, self.model, self.api_key):
-            w.setEnabled(not builtin)
-        if builtin:
-            self.key_hint.setText(
-                "앱 내장 모델. GPU(NVIDIA·AMD·Intel)가 있으면 자동 가속, "
-                "없으면 CPU로 동작합니다. 설정이 필요 없습니다."
-            )
-            return
-        if name == "직접 입력":
-            self.key_hint.setText("주소·모델·키를 직접 입력하세요.")
-            return
-        self.base_url.setText(base_url)
-        self.model.setText(model)
-        if not needs_key:
-            self.key_hint.setText(
-                "로컬 서버이므로 키가 필요 없습니다. 서버를 먼저 실행하세요."
-            )
-        else:
-            self.key_hint.setText(f'키 발급: <a href="{key_url}">{key_url}</a>')
-
-    @staticmethod
-    def _is_local(base_url: str) -> bool:
-        return ("localhost" in base_url) or ("127.0.0.1" in base_url)
 
     # ----------------------------------------------------------- context ---
     def load_transcript(self, name: str, text: str, *,
@@ -863,11 +826,8 @@ class ChatPanel(QWidget):
         self.builtin_status.setVisible(False)
         self.dl_bar.setVisible(False)
 
-    def start_chat_worker(self, worker: ChatWorker | BuiltinWorker):
-        if isinstance(worker, BuiltinWorker):
-            self.model_pool.start(worker)
-        else:
-            self.chat_pool.start(worker)
+    def start_chat_worker(self, worker: BuiltinWorker):
+        self.model_pool.start(worker)
 
     # --------------------------------------------------------- preload ---
     def preload_model(self):
@@ -911,11 +871,8 @@ class ChatPanel(QWidget):
             tab.cancel_worker()
         if self._preload_worker is not None:
             self._preload_worker.cancel()
-        self.chat_pool.clear()
         self.model_pool.clear()
-        chat_done = self.chat_pool.waitForDone(timeout)
-        model_done = self.model_pool.waitForDone(timeout)
-        return chat_done and model_done
+        return self.model_pool.waitForDone(timeout)
 
 
 class MainWindow(QMainWindow):
@@ -1447,10 +1404,6 @@ def _run_selftest() -> int:
     import os
     problems = []
 
-    bp = _banner_image_path()
-    if not bp or not Path(bp).exists():
-        problems.append("banner image missing")
-
     try:
         from .core import _ffmpeg_location
         loc = _ffmpeg_location()
@@ -1482,8 +1435,6 @@ def _run_selftest() -> int:
         win = MainWindow()
         win.show()
         app.processEvents()
-        if win.banner._pix is None and bp:
-            problems.append("banner pixmap failed to load")
     except Exception as e:
         problems.append(f"GUI instantiation failed: {e}")
 
