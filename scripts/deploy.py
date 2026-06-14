@@ -1,20 +1,20 @@
-"""Pack and FTP-deploy the YouTubeTranscriptExtractor release.
+"""FTP-deploy the YouTubeTranscriptExtractor release.
 
-Pipeline on a normal run:
-    1. pack    dist/YouTubeTranscriptExtractor/  ->  dist/YouTubeTranscriptExtractor.zip
-    2. manifest write dist/latest.yml (version from yt_extractor/__init__.py,
+The release artifact `dist/YouTubeTranscriptExtractor.zip` (the installer,
+produced by `scripts/build_installer.ps1`) must already exist. This script does
+NOT build or repack it; it only:
+    1. manifest write dist/latest.yml (version from yt_extractor/__init__.py,
        plus the zip's size + sha512 and a release timestamp)
-    3. upload  zip + latest.yml to the FTP host
+    2. upload  latest.yml + the zip to the FTP host
 
 Credentials and the upload list come from `ftp-config.json` (gitignored — copy
 `ftp-config.example.json` and fill in the real password). Plain FTP by default
 (`"secure": false`); set `"secure": true` for FTPS (FTP over TLS).
 
 Usage (from repo root):
-    py -3.10 scripts/deploy.py            # pack + manifest + upload
+    py -3.10 scripts/deploy.py            # manifest + upload
     py -3.10 scripts/deploy.py --check    # login + list only
-    py -3.10 scripts/deploy.py --dry-run  # pack + manifest, no upload
-    py -3.10 scripts/deploy.py --no-pack  # upload existing files as-is
+    py -3.10 scripts/deploy.py --dry-run  # manifest only, no upload
 
 Config keys (ftp-config.json):
     host        FTP server hostname            e.g. "mazeline.tech"
@@ -33,14 +33,12 @@ import ftplib
 import hashlib
 import json
 import re
-import zipfile
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_CONFIG = _REPO_ROOT / "ftp-config.json"
 _EXAMPLE = "ftp-config.example.json"
 
-_DIST_DIR = _REPO_ROOT / "dist" / "YouTubeTranscriptExtractor"
 _ZIP = _REPO_ROOT / "dist" / "YouTubeTranscriptExtractor.zip"
 _MANIFEST = _REPO_ROOT / "dist" / "latest.yml"
 
@@ -66,17 +64,12 @@ def _sha512(path: Path) -> str:
     return h.hexdigest()
 
 
-def _pack() -> None:
-    if not _DIST_DIR.is_dir():
-        raise SystemExit(f"빌드 폴더가 없습니다: {_DIST_DIR}\n먼저 PyInstaller 빌드를 하세요.")
-    with zipfile.ZipFile(_ZIP, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in _DIST_DIR.rglob("*"):
-            if f.is_file():
-                zf.write(f, arcname=f.relative_to(_DIST_DIR.parent))
-    print(f"패킹: {_ZIP.relative_to(_REPO_ROOT)} ({_human(_ZIP.stat().st_size)})")
-
-
 def _write_manifest() -> None:
+    if not _ZIP.is_file():
+        raise SystemExit(
+            f"릴리스 zip이 없습니다: {_ZIP}\n"
+            "먼저 인스톨러를 빌드하세요: scripts\\build_installer.ps1"
+        )
     version = _app_version()
     size = _ZIP.stat().st_size
     sha = _sha512(_ZIP)
@@ -156,18 +149,16 @@ def _upload(ftp: ftplib.FTP, local: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Pack + FTP-deploy YouTubeTranscriptExtractor release.")
+    ap = argparse.ArgumentParser(description="FTP-deploy YouTubeTranscriptExtractor release (latest.yml + installer zip).")
     ap.add_argument("files", nargs="*", help="업로드 목록 직접 지정 (repo root 기준 상대 경로)")
     ap.add_argument("--config", default=str(_DEFAULT_CONFIG), help="ftp-config.json 경로")
     ap.add_argument("--check", action="store_true", help="로그인 후 원격 디렉터리 목록만 출력")
-    ap.add_argument("--dry-run", action="store_true", help="pack + manifest만, 업로드 안 함")
-    ap.add_argument("--no-pack", action="store_true", help="pack/manifest 건너뛰고 기존 파일 업로드")
+    ap.add_argument("--dry-run", action="store_true", help="manifest만, 업로드 안 함")
     args = ap.parse_args(argv)
 
     cfg = _load_config(Path(args.config))
 
-    if not args.check and not args.no_pack:
-        _pack()
+    if not args.check:
         _write_manifest()
 
     upload_names = args.files or cfg["uploads"]
