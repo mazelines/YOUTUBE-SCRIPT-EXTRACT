@@ -130,6 +130,68 @@ YOUTUBE-SCRIPT-EXTRACTOR/
 
 `core.py`는 GUI에 의존하지 않으므로 CLI 등 다른 프론트엔드에서도 재사용할 수 있습니다.
 
+## 구현 가이드 (개발자용)
+
+### MP4 영상 추출
+
+`extract_video()` 함수는 yt-dlp를 사용해 YouTube 영상을 MP4로 다운로드합니다.
+
+```python
+from yt_extractor.core import extract_video
+
+# 1080p 영상 다운로드 (H.264 우선)
+mp4_path = extract_video(url, output_dir, height=1080)
+```
+
+**구현 세부사항:**
+
+1. **포맷 선택 로직** (`core.py:847-851`):
+   - H.264(`vcodec^=avc1`) 우선 → 호환성 최우선
+   - AV1/VP9는 일부 플레이어에서 재생 불가 (예: Windows 기본 플레이어)
+   - 원본 화질 요청 시 `height=0` 전달
+
+2. **재인코딩 없는 remux** (`core.py:856`):
+   - `FFmpegVideoRemuxer`로 컨테이너만 MP4로 변경
+   - 화질 손실 없이 빠른 처리 (seconds 단위)
+
+3. **병렬 다운로드 최적화** (`core.py:663-680`):
+   - aria2c 사용 시 16개 연결로 분할 다운로드
+   - 없으면 yt-dlp 내장 fragment 병렬 다운로드 사용
+   - `_ensure_aria2c_on_path()`로 번들된 바이너리 자동 탐지
+
+4. **취소 지원**:
+   - `should_cancel` 콜백으로 진행 중인 작업 중단 가능
+   - yt-dlp hook 내부에서 `_Cancelled` 예외 발생
+
+### MP3 음원 추출
+
+`extract_audio_mp3()`는 동일한 `_download()` 파이프라인을 사용합니다.
+
+```python
+from yt_extractor.core import extract_audio_mp3
+
+# 192kbps MP3 추출
+mp3_path = extract_audio_mp3(url, output_dir, bitrate="192")
+```
+
+포맷: `bestaudio/best` → `FFmpegExtractAudio` postprocessor.
+
+### 확장: 새로운 포맷 추가
+
+`_download()`는 일반적인 다운로드 파이프라인입니다. 예를 들어 WEBM 추출:
+
+```python
+def extract_webm(url, out_dir, **kwargs):
+    return _download(
+        url, out_dir,
+        fmt="bestvideo+bestaudio",
+        postprocessors=[{"key": "FFmpegVideoRemuxer", "preferedformat": "webm"}],
+        out_ext="webm",
+        merge_output_format="webm",
+        **kwargs
+    )
+```
+
 ## 참고
 
 - 자막은 YouTube가 제공하는 경우에만 추출됩니다. 자막이 비활성화된 영상은 추출할 수 없습니다.
