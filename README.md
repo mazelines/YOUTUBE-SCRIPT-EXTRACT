@@ -154,10 +154,9 @@ mp4_path = extract_video(url, output_dir, height=1080)
    - `FFmpegVideoRemuxer`로 컨테이너만 MP4로 변경
    - 화질 손실 없이 빠른 처리 (seconds 단위)
 
-3. **병렬 다운로드 최적화** (`core.py:663-680`):
-   - aria2c 사용 시 16개 연결로 분할 다운로드
-   - 없으면 yt-dlp 내장 fragment 병렬 다운로드 사용
-   - `_ensure_aria2c_on_path()`로 번들된 바이너리 자동 탐지
+3. **병렬 다운로드** — yt-dlp 내장 fragment 병렬 다운로더(`concurrent_fragment_downloads`)를 사용합니다.
+
+   > **다운로드 실패 원인(해결됨):** 과거에는 aria2c를 외부 다운로더로 사용했으나, YouTube + Windows 환경에서 aria2c가 `WSAENETUNREACH`(unreachable network) 에러로 종료(exit 1)되어 **MP3·MP4 다운로드가 모두 실패**했습니다. aria2c 경로를 제거하고 네이티브 다운로더로 통일해 해결했습니다. (`_download_accel_opts()` 참고)
 
 4. **취소 지원**:
    - `should_cancel` 콜백으로 진행 중인 작업 중단 가능

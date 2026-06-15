@@ -74,10 +74,10 @@ _STATUS_COLORS = {
 def _force_kill_process_tree():
     """Last-resort shutdown: kill this process and all of its children.
 
-    yt-dlp/ffmpeg/aria2c run on QThreadPool threads and spawn child processes;
+    yt-dlp/ffmpeg run on QThreadPool threads and spawn child processes;
     none can always be stopped cooperatively. If a worker is stuck in such
     native work at exit, terminating the whole tree guarantees the app (and its
-    aria2c/ffmpeg children) never lingers in Task Manager.
+    ffmpeg children) never lingers in Task Manager.
     """
     pid = os.getpid()
     if os.name == "nt":
@@ -1418,7 +1418,7 @@ class MainWindow(QMainWindow):
         if ext_done and chat_done:
             return
 
-        # A worker is stuck in uninterruptible native work (yt-dlp/ffmpeg/aria2c,
+        # A worker is stuck in uninterruptible native work (yt-dlp/ffmpeg,
         # or the model load). Without this the QThreadPool thread would keep the
         # interpreter — and the process — alive after the window closes. Kill the
         # whole process tree so nothing lingers.
