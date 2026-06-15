@@ -683,26 +683,33 @@ class _Cancelled(Exception):
     """Internal signal raised from a yt-dlp hook to abort an in-flight download."""
 
 
-def extract_audio_mp3(
+def _download(
     url_or_id: str,
     out_dir: str | Path,
-    bitrate: str = "192",
+    *,
+    fmt: str,
+    postprocessors: list,
+    out_ext: str,
     progress=None,
     should_cancel=None,
+    **extra_opts,
 ) -> Path:
-    """Download a video's audio and convert it to MP3.
+    """Download a video with yt-dlp and run `postprocessors` (audio extract or
+    video remux), then return the written file.
 
-    `bitrate` is a kbps string ("128", "192", "320"). `progress` is an optional
-    callable(str). `should_cancel` is an optional callable() -> bool; when it
-    returns True (e.g. the app is shutting down) the download is aborted from
-    inside yt-dlp's hooks so the worker thread returns promptly instead of
-    blocking process exit. Returns the written .mp3 path. Raises ExtractionError.
+    `fmt` is the yt-dlp format string; `out_ext` is the final extension
+    ("mp3", "mp4"). `extra_opts` are merged into ydl_opts (e.g.
+    merge_output_format). `progress` is an optional callable(str). `should_cancel` is
+    an optional callable() -> bool; when it returns True (e.g. the app is
+    shutting down) the download is aborted from inside yt-dlp's hooks so the
+    worker thread returns promptly instead of blocking process exit. Shared by
+    extract_audio_mp3 and extract_video. Raises ExtractionError.
     """
     try:
         import yt_dlp
     except ImportError:
         raise ExtractionError(
-            "MP3 추출에는 yt-dlp가 필요합니다 (pip install yt-dlp)."
+            "다운로드에는 yt-dlp가 필요합니다 (pip install yt-dlp)."
         )
 
     def report(msg):
@@ -722,6 +729,7 @@ def extract_audio_mp3(
 
     # Track the final filename reported by the postprocessor.
     final_path = {"path": None}
+    label = out_ext.upper()
 
     def progress_hook(d):
         # Raising here is yt-dlp's supported way to abort a running download.
@@ -731,9 +739,9 @@ def extract_audio_mp3(
         if status == "downloading":
             pct = d.get("_percent_str", "").strip()
             spd = d.get("_speed_str", "").strip()
-            report(f"음원 다운로드 중… {pct} {spd}".strip())
+            report(f"다운로드 중… {pct} {spd}".strip())
         elif status == "finished":
-            report("MP3로 변환 중…")
+            report(f"{label}(으)로 변환 중…")
 
     def postproc_hook(d):
         if cancelled():
@@ -745,19 +753,16 @@ def extract_audio_mp3(
                 final_path["path"] = fp
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": fmt,
         "outtmpl": str(out / "%(title)s [%(id)s].%(ext)s"),
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": str(bitrate),
-        }],
+        "postprocessors": postprocessors,
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
         "progress_hooks": [progress_hook],
         "postprocessor_hooks": [postproc_hook],
     }
+    ydl_opts.update(extra_opts)
     ydl_opts.update(_download_accel_opts())
     ffloc = _ffmpeg_location()
     if ffloc:
@@ -778,21 +783,78 @@ def extract_audio_mp3(
         msg = str(e)
         if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower():
             raise ExtractionError(
-                "MP3 변환을 위한 ffmpeg를 찾을 수 없습니다. "
+                "변환을 위한 ffmpeg를 찾을 수 없습니다. "
                 "`pip install imageio-ffmpeg`로 해결하거나 ffmpeg를 설치하세요."
             )
-        raise ExtractionError(f"음원 추출 실패: {msg}")
+        raise ExtractionError(f"다운로드 실패: {msg}")
 
-    # Resolve the produced .mp3 path.
+    # Resolve the produced file path.
     path = final_path["path"]
     if not path:
         # Derive from the template using the info dict.
         title = (info or {}).get("title", video_id)
         base = out / safe_filename(title, video_id)
-        path = str(base.with_suffix(".mp3"))
-    mp3_path = Path(path).with_suffix(".mp3")
-    if not mp3_path.exists():
-        raise ExtractionError("MP3 파일이 생성되지 않았습니다.")
+        path = str(base.with_suffix("." + out_ext))
+    final = Path(path).with_suffix("." + out_ext)
+    if not final.exists():
+        raise ExtractionError(f"{label} 파일이 생성되지 않았습니다.")
 
-    report("MP3 저장 완료")
-    return mp3_path
+    report(f"{label} 저장 완료")
+    return final
+
+
+def extract_audio_mp3(
+    url_or_id: str,
+    out_dir: str | Path,
+    bitrate: str = "192",
+    progress=None,
+    should_cancel=None,
+) -> Path:
+    """Download a video's audio and convert it to MP3.
+
+    `bitrate` is a kbps string ("128", "192", "320"). See _download for the
+    shared options. Returns the written .mp3 path.
+    """
+    return _download(
+        url_or_id, out_dir,
+        fmt="bestaudio/best",
+        postprocessors=[{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": str(bitrate),
+        }],
+        out_ext="mp3",
+        progress=progress, should_cancel=should_cancel,
+    )
+
+
+def extract_video(
+    url_or_id: str,
+    out_dir: str | Path,
+    height: int = 1080,
+    progress=None,
+    should_cancel=None,
+) -> Path:
+    """Download a video as MP4, capped at `height` pixels (0 = best available).
+
+    Remuxes to an MP4 container without re-encoding (fast, lossless). See
+    _download for the shared options. Returns the written .mp4 path.
+    """
+    h = f"[height<={height}]" if height else ""
+    # Prefer H.264 (avc1) video — AV1/VP9 at 1080p plays as audio-only on
+    # players without those decoders (e.g. Windows' built-in). Fall back to any
+    # mp4, then any format, so download never fails outright.
+    fmt = (
+        f"bestvideo{h}[vcodec^=avc1]+bestaudio[ext=m4a]/"
+        f"bestvideo{h}[ext=mp4]+bestaudio/"
+        f"best{h}[ext=mp4]/best{h}"
+    )
+    return _download(
+        url_or_id, out_dir,
+        fmt=fmt,
+        # preferedformat (single 'r') is yt-dlp's historical spelling.
+        postprocessors=[{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+        out_ext="mp4",
+        merge_output_format="mp4",
+        progress=progress, should_cancel=should_cancel,
+    )
