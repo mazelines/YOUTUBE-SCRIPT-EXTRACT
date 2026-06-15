@@ -32,6 +32,7 @@ from .core import (
     extract_video_id,
     extract_to_markdown,
     extract_audio_mp3,
+    extract_video,
     ExtractionError,
     TRANSCRIPT_TIMESTAMPED,
     TRANSCRIPT_SENTENCES,
@@ -103,12 +104,13 @@ class WorkerSignals(QObject):
 class ExtractWorker(QRunnable):
     """Extract a single video's transcript and/or MP3 audio.
 
-    `outputs` selects what to produce: any of {"transcript", "audio"}.
+    `outputs` selects what to produce: any of {"transcript", "audio", "video"}.
     """
 
     def __init__(self, row: int, url: str, out_dir: str, outputs: set,
                  langs, prefer_manual: bool, transcript_format: str, bitrate: str,
-                 translate_to: str | None = None, should_cancel=None):
+                 translate_to: str | None = None, should_cancel=None,
+                 video_height: int = 1080):
         super().__init__()
         self.row = row
         self.url = url
@@ -118,6 +120,7 @@ class ExtractWorker(QRunnable):
         self.prefer_manual = prefer_manual
         self.transcript_format = transcript_format
         self.bitrate = bitrate
+        self.video_height = video_height
         self.translate_to = translate_to
         self.should_cancel = should_cancel
         self.signals = WorkerSignals()
@@ -163,6 +166,19 @@ class ExtractWorker(QRunnable):
                 errors.append(("MP3", str(e)))
             except Exception as e:
                 errors.append(("MP3", f"예기치 못한 오류: {e}"))
+
+        if "video" in self.outputs and not self._cancelled():
+            try:
+                path = extract_video(
+                    self.url, self.out_dir, height=self.video_height,
+                    progress=lambda m: self.signals.detail.emit(row, f"[영상] {m}"),
+                    should_cancel=self.should_cancel,
+                )
+                files.append(("MP4", str(path)))
+            except ExtractionError as e:
+                errors.append(("MP4", str(e)))
+            except Exception as e:
+                errors.append(("MP4", f"예기치 못한 오류: {e}"))
 
         if errors and files:
             self.signals.status.emit(row, ST_PARTIAL)
@@ -982,8 +998,10 @@ class MainWindow(QMainWindow):
         self.transcript_cb = QCheckBox("자막 (.md)")
         self.transcript_cb.setChecked(True)
         self.audio_cb = QCheckBox("MP3 음원")
+        self.video_cb = QCheckBox("MP4 영상")
         out_row.addWidget(self.transcript_cb)
         out_row.addWidget(self.audio_cb)
+        out_row.addWidget(self.video_cb)
         out_row.addStretch(1)
         out_widget = QWidget()
         out_widget.setLayout(out_row)
@@ -995,6 +1013,12 @@ class MainWindow(QMainWindow):
         self.bitrate_combo.setCurrentIndex(1)  # 192
         opt.addWidget(self.bitrate_combo, 3, 3)
 
+        opt.addWidget(QLabel("영상 화질:"), 5, 2)
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(["1080p", "720p", "원본(최고화질)"])
+        self.quality_combo.setCurrentIndex(0)  # 1080p
+        opt.addWidget(self.quality_combo, 5, 3)
+
         self.translate_cb = QCheckBox("🌐 한국어 번역도 함께 저장 (.ko.md)")
         self.translate_cb.setToolTip(
             "원문이 한국어가 아닐 때, YouTube의 번역 자막을 별도 '.ko.md' "
@@ -1005,6 +1029,7 @@ class MainWindow(QMainWindow):
         # Enable/disable dependent controls with their output type.
         self.transcript_cb.toggled.connect(self._sync_output_controls)
         self.audio_cb.toggled.connect(self._sync_output_controls)
+        self.video_cb.toggled.connect(self._sync_output_controls)
         self._sync_output_controls()
 
         root.addWidget(opt_group)
@@ -1101,6 +1126,7 @@ class MainWindow(QMainWindow):
             b.setEnabled(want_t)
         self.translate_cb.setEnabled(want_t)
         self.bitrate_combo.setEnabled(want_a)
+        self.quality_combo.setEnabled(self.video_cb.isChecked())
 
     def _set_status_item(self, row: int, status: str):
         item = QTableWidgetItem(status)
@@ -1229,14 +1255,14 @@ class MainWindow(QMainWindow):
     def _set_controls_enabled(self, enabled: bool):
         for w in (self.start_btn, self.add_btn, self.dir_btn,
                   self.concurrency, self.clear_all_btn,
-                  self.transcript_cb, self.audio_cb):
+                  self.transcript_cb, self.audio_cb, self.video_cb):
             w.setEnabled(enabled)
         if enabled:
             self._sync_output_controls()  # re-apply per-output enable rules
         else:
             for w in (self.lang_input, self.manual_cb, self._fmt_sentence,
                       self._fmt_paragraph, self._fmt_timestamp,
-                      self.translate_cb, self.bitrate_combo):
+                      self.translate_cb, self.bitrate_combo, self.quality_combo):
                 w.setEnabled(False)
 
     def on_start(self):
@@ -1255,10 +1281,12 @@ class MainWindow(QMainWindow):
             outputs.add("transcript")
         if self.audio_cb.isChecked():
             outputs.add("audio")
+        if self.video_cb.isChecked():
+            outputs.add("video")
         if not outputs:
             QMessageBox.information(
                 self, "추출 항목 없음",
-                "자막 또는 MP3 음원 중 하나 이상을 선택하세요."
+                "자막 · MP3 음원 · MP4 영상 중 하나 이상을 선택하세요."
             )
             return
 
@@ -1273,6 +1301,9 @@ class MainWindow(QMainWindow):
         else:
             transcript_format = TRANSCRIPT_SENTENCES
         bitrate = self.bitrate_combo.currentText().split()[0]  # "192 kbps" -> "192"
+        # "1080p"->1080, "720p"->720, "원본(최고화질)"->0 (no cap)
+        q = self.quality_combo.currentText()
+        video_height = int(q[:-1]) if q.endswith("p") else 0
         translate_to = "ko" if self.translate_cb.isChecked() else None
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1293,6 +1324,7 @@ class MainWindow(QMainWindow):
                 langs, prefer_manual, transcript_format, bitrate,
                 translate_to=translate_to,
                 should_cancel=self._shutdown.is_set,
+                video_height=video_height,
             )
             worker.signals.status.connect(self._on_worker_status)
             worker.signals.detail.connect(self._on_worker_detail)
