@@ -5,7 +5,6 @@ front-ends."""
 from __future__ import annotations
 
 import re
-import sys
 import json
 import datetime as _dt
 from dataclasses import dataclass, field
@@ -623,59 +622,18 @@ def _ffmpeg_location():
         return None  # let yt-dlp find ffmpeg on PATH
 
 
-def _bundled_bin_dirs():
-    """Directories that may hold binaries we ship (e.g. aria2c).
-
-    Covers a PyInstaller one-file build (extracted under sys._MEIPASS) and a
-    plain source checkout (yt_extractor/bin/).
-    """
-    dirs = []
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        dirs.append(Path(meipass) / "bin")
-        dirs.append(Path(meipass))
-    dirs.append(Path(__file__).resolve().parent / "bin")
-    return dirs
-
-
-def _ensure_aria2c_on_path():
-    """Make an aria2c executable discoverable; return its directory or None.
-
-    Prefers one already on PATH; otherwise, if we bundle aria2c under bin/, we
-    prepend that directory to PATH so yt-dlp's executable lookup finds it (a
-    frozen app's bundled binaries are not on PATH by default).
-    """
-    import os
-    import shutil
-
-    found = shutil.which("aria2c")
-    if found:
-        return os.path.dirname(found)
-
-    exe = "aria2c.exe" if os.name == "nt" else "aria2c"
-    for base in _bundled_bin_dirs():
-        if (base / exe).exists():
-            os.environ["PATH"] = str(base) + os.pathsep + os.environ.get("PATH", "")
-            return str(base)
-    return None
-
-
 def _download_accel_opts():
-    """yt-dlp options that speed up the download (the real bottleneck).
+    """yt-dlp options that parallelize the network step (the real bottleneck).
 
-    MP3 encoding is CPU-only and near-instant; GPU codecs apply to video, not
-    audio. So the win is in the network step: prefer aria2c with many parallel
-    connections when available (bundled or on PATH), otherwise fall back to
-    yt-dlp's built-in concurrent fragment downloads. Returns a dict to merge
-    into ydl_opts.
+    MP3 encoding is CPU-only and near-instant; the cost is downloading. We use
+    yt-dlp's built-in concurrent fragment downloader for DASH/HLS streams.
+
+    NOTE: aria2c as an external downloader was tried but reliably fails on
+    YouTube on Windows — WSAENETUNREACH ("A socket operation was attempted to
+    an unreachable network"), aria2c exits 1, every MP3/MP4 download fails.
+    Native download is both reliable and starts near-instantly. Returns a dict
+    to merge into ydl_opts.
     """
-    if _ensure_aria2c_on_path():
-        return {
-            "external_downloader": "aria2c",
-            # -x/-s: up to 16 connections/splits per download; -k1M: split size.
-            "external_downloader_args": ["-x16", "-s16", "-k1M"],
-        }
-    # aria2c unavailable: still parallelize fragmented (DASH/HLS) streams.
     return {"concurrent_fragment_downloads": 4}
 
 
