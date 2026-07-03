@@ -18,6 +18,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl, QTimer,
+    QStandardPaths,
 )
 from PySide6.QtGui import QDesktopServices, QBrush, QColor, QPixmap
 from PySide6.QtWidgets import (
@@ -318,6 +319,49 @@ class PreloadWorker(QRunnable):
 BANNER_URL = "https://mazeline.tech/"
 
 
+def _default_output_dir() -> str:
+    """Return a writable default output folder.
+
+    Installed builds run from Program Files, so a cwd-relative default can make
+    extraction fail when the app tries to create or write transcripts there.
+    Prefer Documents, then AppData, and only fall back to cwd if it is the first
+    writable option in the current environment.
+    """
+    candidates = []
+    docs = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+    if docs:
+        candidates.append(Path(docs) / "YouTubeTranscriptExtractor" / "transcripts")
+
+    app_data = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
+    if app_data:
+        candidates.append(Path(app_data) / "transcripts")
+
+    candidates.extend([
+        Path.home() / "YouTubeTranscriptExtractor" / "transcripts",
+        Path.cwd() / "transcripts",
+    ])
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-test"
+            probe.write_text("ok", encoding="utf-8")
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return str(candidate)
+        except OSError:
+            continue
+
+    return str(candidates[0])
+
+
 def _resource_base():
     """Base directory for bundled resources.
 
@@ -419,11 +463,10 @@ class ChatTab(QWidget):
     """
 
     def __init__(self, panel: "ChatPanel", quick_label: str, quick_prompt: str,
-                 placeholder: str = "", manual_instruction: str | None = None):
+                 placeholder: str = ""):
         super().__init__()
         self.panel = panel
         self.quick_prompt = quick_prompt
-        self.manual_instruction = manual_instruction
         self._history: list[dict] = []
         self._worker: BuiltinWorker | None = None
         self._streaming_assistant: str | None = None
@@ -478,13 +521,13 @@ class ChatTab(QWidget):
         lay.addLayout(quick)
 
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("메시지 입력 (Ctrl+Enter 전송)")
+        self.input.setPlaceholderText("결과에 대한 추가 질문 입력 (Ctrl+Enter: 질문하기)")
         self.input.setMaximumHeight(80)
         self.input.installEventFilter(self)
         lay.addWidget(self.input)
 
         send_row = QHBoxLayout()
-        self.send_btn = QPushButton("전송")
+        self.send_btn = QPushButton("질문하기")
         self.send_btn.setStyleSheet("font-weight: bold;")
         self.send_btn.clicked.connect(self.on_send_clicked)
         send_row.addWidget(self.send_btn)
@@ -515,31 +558,34 @@ class ChatTab(QWidget):
                 "'AI로 번역'을 눌러 불러오세요.",
             )
             return
-        self._send(self.quick_prompt)
+        self._send(self.quick_prompt,
+                   translate_full=(self is self.panel.translate_tab))
 
     def on_send_clicked(self):
         text = self.input.toPlainText().strip()
         if not text:
             return
         self.input.clear()
-        if self.manual_instruction:
-            text = f"{self.manual_instruction}\n\n{text}"
+        # Follow-up question on the summary/translation result: send as a plain
+        # chat turn over history + transcript context. No manual_instruction
+        # prepend, no chunking — the model answers the question asked.
         self._send(text)
 
-    def _send(self, text: str):
+    def _send(self, text: str, *, translate_full: bool = False):
         if self._worker is not None:
             QMessageBox.information(self, "응답 대기 중",
                                     "현재 답변이 끝난 뒤 보내주세요.")
             return
         panel = self.panel
-        # Translate tab: translate the transcript body (header metadata
-        # excluded) under the strict translation-only prompt, split into chunks
-        # so a long video can't overflow the model's n_ctx and get truncated.
-        # The results stream back as one continuous answer. A short transcript
-        # is just a single chunk through the same path, so behaviour is uniform.
-        is_translate = self is panel.translate_tab
+        # Initial translation (quick button or 'AI로 번역'): translate the
+        # transcript body (header metadata excluded) under the strict
+        # translation-only prompt, split into chunks so a long video can't
+        # overflow the model's n_ctx and get truncated. Results stream back as
+        # one continuous answer. Follow-up questions (질문하기) never take this
+        # path — they go through the normal chat-completion array, so the model
+        # answers the question instead of re-translating the whole transcript.
         chunks = None
-        if is_translate and panel._attached:
+        if translate_full and panel._attached:
             body = transcript_body("\n\n".join(t for _, t in panel._attached if t))
             chunks = split_for_translation(body) or None
 
@@ -746,10 +792,9 @@ class ChatPanel(QWidget):
         self.translate_tab = ChatTab(
             self, "🌐 자막 번역 시작", TRANSLATE_PROMPT,
             placeholder=(
-                "왼쪽에서 자막을 추출해 'AI로 번역'을 누르거나, "
-                "여기에 번역할 부분을 입력하세요."
+                "왼쪽에서 자막을 추출해 'AI로 번역'을 누르세요. "
+                "번역 결과에 대한 추가 질문은 여기에 입력하세요."
             ),
-            manual_instruction="다음 내용을 자연스러운 한국어로 번역해 주세요:",
         )
         self.tabs.addTab(self.summary_tab, "📝 요약")
         self.tabs.addTab(self.translate_tab, "🌐 번역")
@@ -781,7 +826,7 @@ class ChatPanel(QWidget):
             self.summary_tab._send(SUMMARY_PROMPT)
         elif translate:
             self.tabs.setCurrentWidget(self.translate_tab)
-            self.translate_tab._send(TRANSLATE_PROMPT)
+            self.translate_tab._send(TRANSLATE_PROMPT, translate_full=True)
 
     def _refresh_context_label(self):
         if not self._attached:
@@ -898,7 +943,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 980)
 
         self.pool = QThreadPool.globalInstance()
-        self.out_dir = str(Path.cwd() / "transcripts")
+        self.out_dir = _default_output_dir()
         self._total = 0
         self._completed = 0
         self._running = False
@@ -1465,10 +1510,18 @@ def _run_selftest() -> int:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         app = QApplication(sys.argv)
         win = MainWindow()
+        out_dir = Path(win.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        probe = out_dir / ".selftest-write"
+        probe.write_text("ok", encoding="utf-8")
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
         win.show()
         app.processEvents()
     except Exception as e:
-        problems.append(f"GUI instantiation failed: {e}")
+        problems.append(f"GUI/output setup failed: {e}")
 
     result = "SELFTEST OK" if not problems else "SELFTEST FAIL: " + "; ".join(problems)
     result += f" | {llama_status}"
