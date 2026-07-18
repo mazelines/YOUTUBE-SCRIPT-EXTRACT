@@ -143,6 +143,11 @@ class TranscriptResult:
     language_code: str
     is_generated: bool
     snippets: list = field(default_factory=list)  # list of (text, start, duration)
+    # Where the captions came from: "youtube" (official/auto-caption) or
+    # "stt" (faster-whisper on captured audio). Lets the markdown builder
+    # decide the output suffix (".stt.md" vs ".md") without string-matching
+    # the language label, which is fragile under localisation.
+    origin: str = "youtube"
 
 
 def _select_transcript(transcript_list, preferred_langs, prefer_manual):
@@ -165,7 +170,10 @@ def _select_transcript(transcript_list, preferred_langs, prefer_manual):
         for finder in order:
             try:
                 return finder()
-            except (NoTranscriptFound, Exception):
+            except Exception:
+                # NoTranscriptFound is a subclass of Exception; listing both
+                # in the tuple was redundant. Any miss just means "try the
+                # next finder" (manual -> generated -> ...).
                 continue
 
     # Fall back to whatever exists, preferring manual.
@@ -534,11 +542,11 @@ def extract_to_markdown(
     translate_to: str | None = None,
     progress=None,
 ) -> list[Path]:
-    """Original one-shot pipeline (transcript -> markdown). Kept for backward
-    compatibility; new callers should use ``extract_to_markdown_with_fallback``
-    which dispatches to this when no fallback is requested.
-    """
     """Full pipeline: parse -> meta -> transcript -> markdown -> file.
+
+    Original one-shot path (no fallback). New callers usually want
+    ``extract_to_markdown_with_fallback``, which dispatches here when no
+    polling/STT fallback is requested.
 
     When ``translate_to`` is a language code (e.g. ``"ko"``) and the source
     transcript is in a different language, a second ``.md`` is written next to
@@ -601,9 +609,14 @@ def extract_to_markdown(
 # explicitly asks via extract_to_markdown_with_fallback.
 # --------------------------------------------------------------------------- #
 
-# Per-process cache of is_live_video() answers; a live status never flips back
-# mid-run and the probe is an extra HTTP round-trip, so memoise it.
-_live_cache: dict[str, bool] = {}
+# Per-process cache of is_live_video() answers, keyed by video id, with the
+# time.monotonic() timestamp at which the answer was obtained. The probe is an
+# extra HTTP round-trip, so memoising avoids re-probing during a batch; but a
+# live stream eventually ends, so we expire entries after _LIVE_CACHE_TTL_SEC
+# — otherwise a long-running GUI session would keep treating a finished stream
+# as live forever.
+_live_cache: dict[str, tuple[bool, float]] = {}
+_LIVE_CACHE_TTL_SEC = 300.0  # 5 minutes
 
 
 def fetch_transcript_or_none(
@@ -654,6 +667,7 @@ def fetch_transcript_with_polling(
             progress(msg)
 
     deadline = time.monotonic() + max_wait_min * 60.0
+    start = time.monotonic()
     attempt = 0
     while True:
         if should_cancel and should_cancel():
@@ -667,10 +681,14 @@ def fetch_transcript_with_polling(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
-        waited_min = attempt * poll_interval_sec / 60.0
+        # Report actual elapsed time since polling started, not attempt*n.
+        # The first attempt happens immediately (0s elapsed), so the message
+        # correctly reads "(0/30분)" right after the first miss rather than
+        # the old "(1/30분)" which implied a minute had already passed.
+        elapsed_min = (time.monotonic() - start) / 60.0
         report(
-            f"자막 생성 대기 중… ({waited_min:.0f}/{max_wait_min:.0f}분, "
-            f"다음 시도 {poll_interval_sec:.0f}초 후)"
+            f"자막 생성 대기 중… ({elapsed_min:.0f}/{max_wait_min:.0f}분, "
+            f"다음 시도 {poll_interval_sec:.0f}초 후, {attempt}회 시도)"
         )
         # Sleep in small slices so a cancel is noticed within a second.
         sleep_remaining = min(poll_interval_sec, remaining)
@@ -687,16 +705,25 @@ def is_live_video(video_id: str, timeout: float = 8.0) -> bool:
     """Probe whether ``video_id`` is a live stream (or upcoming premiere).
 
     Uses yt-dlp with download disabled — the lightest way to read the
-    ``is_live`` / ``live_status`` fields. Memoised per process; on any failure
-    (network, private video, etc.) returns ``False`` so callers fall through to
-    the VOD path instead of refusing to process a possibly-live video.
+    ``is_live`` / ``live_status`` fields. Memoised per process with a TTL
+    (``_LIVE_CACHE_TTL_SEC``): a live stream can transition to a VOD while
+    the app stays open, so a permanent cache would mis-route finished streams
+    to the live-capture path forever. On any failure (network, private video,
+    etc.) returns ``False`` so callers fall through to the VOD path instead of
+    refusing to process a possibly-live video.
     """
-    if video_id in _live_cache:
-        return _live_cache[video_id]
+    import time
+
+    cached = _live_cache.get(video_id)
+    if cached is not None:
+        value, ts = cached
+        if time.monotonic() - ts < _LIVE_CACHE_TTL_SEC:
+            return value
+        # expired — fall through and re-probe
     try:
         import yt_dlp
     except ImportError:
-        _live_cache[video_id] = False
+        _live_cache[video_id] = (False, time.monotonic())
         return False
     opts = {"quiet": True, "no_warnings": True, "skip_download": True,
             "noplaylist": True}
@@ -704,13 +731,19 @@ def is_live_video(video_id: str, timeout: float = 8.0) -> bool:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(canonical_url(video_id), download=False) or {}
     except Exception:
-        _live_cache[video_id] = False
+        _live_cache[video_id] = (False, time.monotonic())
         return False
     live = bool(info.get("is_live")) or info.get("live_status") in (
         "is_live", "is_upcoming",
     )
-    _live_cache[video_id] = live
+    _live_cache[video_id] = (live, time.monotonic())
     return live
+
+
+# MP3 bitrate for STT-bound audio. Speech recognition gains nothing from
+# higher bitrates, so we keep STT downloads small to bound the faster-whisper
+# input size and the live-capture file growth.
+STT_AUDIO_BITRATE = "128"
 
 
 def _download_for_stt(
@@ -779,76 +812,16 @@ def _download_for_stt(
         )
 
     # ------------------------------------------------------------------- VOD
-    final_path = {"path": None}
-
-    def progress_hook(d):
-        if should_cancel and should_cancel():
-            raise _Cancelled()
-        status = d.get("status")
-        if status == "downloading":
-            pct = d.get("_percent_str", "").strip()
-            spd = d.get("_speed_str", "").strip()
-            eta = d.get("_eta_str", "").strip()
-            report(f"음성 다운로드 중… {pct} {spd} ETA {eta}".strip())
-        elif status == "finished":
-            report("음성 → 텍스트 변환 준비 중…")
-
-    def postproc_hook(d):
-        if should_cancel and should_cancel():
-            raise _Cancelled()
-        if d.get("status") == "finished":
-            info = d.get("info_dict") or {}
-            fp = info.get("filepath")
-            if fp:
-                final_path["path"] = fp
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": str(out / "%(title)s [%(id)s].%(ext)s"),
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "128",   # speech needs little bandwidth
-        }],
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "progress_hooks": [progress_hook],
-        "postprocessor_hooks": [postproc_hook],
-    }
-    ydl_opts.update(_download_accel_opts())
-    if ffloc:
-        ydl_opts["ffmpeg_location"] = ffloc
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(canonical_url(video_id), download=True)
-    except _Cancelled:
-        raise ExtractionError("작업이 취소되었습니다.")
-    except Exception as e:
-        if isinstance(e.__cause__, _Cancelled) or isinstance(
-            getattr(e, "exc_info", [None])[1] if hasattr(e, "exc_info") else None,
-            _Cancelled,
-        ):
-            raise ExtractionError("작업이 취소되었습니다.")
-        msg = str(e)
-        if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower():
-            raise ExtractionError(
-                "변환을 위한 ffmpeg를 찾을 수 없습니다. "
-                "`pip install imageio-ffmpeg`로 해결하거나 ffmpeg를 설치하세요."
-            )
-        raise ExtractionError(f"음성 다운로드 실패: {msg}")
-
-    path = final_path["path"]
-    if not path:
-        title = (info or {}).get("title", video_id)
-        base = out / safe_filename(title, video_id)
-        path = str(base.with_suffix(".mp3"))
-    final = Path(path).with_suffix(".mp3")
-    if not final.exists():
-        raise ExtractionError("음성 파일이 생성되지 않았습니다.")
-    report("음성 다운로드 완료")
-    return final
+    # Delegate to the same _download pipeline extract_audio_mp3 uses, so the
+    # VOD path gets the same cancel/ffmpeg-error handling as MP3 extraction
+    # instead of a duplicated yt-dlp invocation here. 128 kbps is plenty for
+    # speech (STT doesn't benefit from higher bitrates).
+    return extract_audio_mp3(
+        url_or_id, out_dir,
+        bitrate=STT_AUDIO_BITRATE,
+        progress=progress,
+        should_cancel=should_cancel,
+    )
 
 
 def _capture_live_audio(*, ydl_module, video_id, out_dir, capture_minutes,
@@ -894,48 +867,87 @@ def _capture_live_audio(*, ydl_module, video_id, out_dir, capture_minutes,
     if not out_name.endswith(".live.mp3"):
         out_name = out_name.rsplit(".", 1)[0] + ".live.mp3"
     out_path = Path(out_dir) / out_name
+    # Write to a .part sidecar then atomically rename, so a half-finished
+    # capture (or a capture that crashes mid-stream) never overwrites an
+    # existing good .live.mp3 the user may be re-running against. Matches the
+    # pattern yt-dlp itself uses for downloads.
+    part_path = out_path.with_suffix(out_path.suffix + ".part")
 
     duration_sec = str(int(float(capture_minutes) * 60))
     # Build ffmpeg args. -user_agent + -headers carry the cookies/auth-style
     # headers yt-dlp would send; without them YouTube's CDN returns 403.
-    header_blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    # Strip CR/LF from keys+values defensively: a maliciously crafted header
+    # value could otherwise inject extra headers via ffmpeg's -headers blob
+    # (yt-dlp is the source so this is defence-in-depth, not a real vector).
+    def _scrub(s: str) -> str:
+        return (s or "").replace("\r", "").replace("\n", "")
+
+    header_blob = "".join(
+        f"{_scrub(k)}: {_scrub(v)}\r\n" for k, v in headers.items()
+    )
+    user_agent = _scrub(headers.get("User-Agent", "")) or "Mozilla/5.0"
     cmd = [
         ffmpeg_exe, "-y",
-        "-user_agent", headers.get("User-Agent", "Mozilla/5.0"),
+        "-user_agent", user_agent,
     ]
     if header_blob:
         cmd += ["-headers", header_blob]
     cmd += [
         "-i", stream_url,
         "-t", duration_sec,
-        "-vn", "-acodec", "libmp3lame", "-b:a", "128k",
+        "-vn", "-acodec", "libmp3lame", "-b:a", f"{STT_AUDIO_BITRATE}k",
         "-rtbufsize", "64M",   # live buffer; avoids "real-time buffer too full"
-        str(out_path),
+        str(part_path),
     ]
 
     report(f"라이브 캡처 중… ({capture_minutes:.0f}분, ffmpeg 직접 녹음)")
+    # Initialise up front: on TimeoutExpired the `proc = subprocess.run(...)`
+    # assignment never happens, so the post-check must still be able to
+    # reference `proc` without a NameError masking the real failure.
+    proc = None
+    run_kwargs = {
+        "capture_output": True,
+        # Give a generous wall-clock budget: ffmpeg finishes faster than
+        # real-time once it has buffered, but the live stream is real-time
+        # so we allow capture_minutes + 120s slack + startup.
+        "timeout": float(capture_minutes) * 60.0 + 120.0,
+        "check": False,
+    }
+    # In a PyInstaller --noconsole (windowed) build, a subprocess that wants
+    # a console allocates its own black cmd window — ffmpeg would sit on the
+    # user's screen for up to `capture_minutes`. CREATE_NO_WINDOW prevents
+    # that. Mirrors _force_kill_process_tree in app.py.
+    if os.name == "nt":
+        run_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True,
-            # Give a generous wall-clock budget: ffmpeg finishes faster than
-            # real-time once it has buffered, but the live stream is real-time
-            # so we allow capture_minutes + 60s slack + startup.
-            timeout=float(capture_minutes) * 60.0 + 120.0,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
+        proc = subprocess.run(cmd, **run_kwargs)
+    except subprocess.TimeoutExpired as e:
         # ffmpeg ran past the budget — usually means the stream stalled.
         # Keep whatever partial output we have rather than failing outright.
+        # `e` carries the partial output/stderr if any was captured.
         report("라이브 캡처 시간 초과 — 받은 구간으로 STT 진행")
     except Exception as e:
         raise ExtractionError(f"라이브 캡처 실행 실패: {e}")
 
-    if not out_path.exists() or out_path.stat().st_size == 0:
-        stderr_tail = proc.stderr.decode("utf-8", "replace")[-400:] if proc else ""
+    # ffmpeg wrote to part_path; promote it to the final name on success, or
+    # clean it up on failure so a stale .part never litters the output dir.
+    if not part_path.exists() or part_path.stat().st_size == 0:
+        try:
+            part_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        stderr_tail = ""
+        if proc is not None and proc.stderr:
+            stderr_tail = proc.stderr.decode("utf-8", "replace")[-400:]
+        rc = proc.returncode if proc is not None else "?"
         raise ExtractionError(
             "라이브 캡처가 음성을 생성하지 못했습니다. "
-            f"(ffmpeg rc={proc.returncode if proc else '?'}; {stderr_tail})"
+            f"(ffmpeg rc={rc}; {stderr_tail})"
         )
+    # os.replace is atomic on the same filesystem: either the rename fully
+    # succeeds (out_path becomes the new capture) or it fails (the previous
+    # out_path is left untouched).
+    os.replace(part_path, out_path)
     report("라이브 캡처 완료")
     return out_path
 
@@ -979,8 +991,9 @@ def _run_stt(
         meta=None,  # filled in by the caller
         language=lang_label,
         language_code=language or "",
-        is_generated=True,  # STT is machine-produced, like auto-captions
+        is_generated=True,  # STT is machine produced, like auto-captions
         snippets=snippets,
+        origin="stt",
     )
 
 
@@ -1082,6 +1095,8 @@ def extract_to_markdown_with_fallback(
             )
 
         report("[STT] 음성 다운로드 중…")
+        audio_path: Path | None = None
+        stt_result = None
         try:
             audio_path = _download_for_stt(
                 url_or_id, out_dir,
@@ -1089,33 +1104,34 @@ def extract_to_markdown_with_fallback(
                 progress=lambda m: report(f"[STT] {m}"),
                 should_cancel=should_cancel,
             )
+
+            # Pick the STT source language from the preferred list (first
+            # entry), but only when it's a single-letter-base code Whisper
+            # understands.
+            stt_lang = None
+            if preferred_langs:
+                first = (preferred_langs[0] or "").split("-")[0].lower()
+                if first:
+                    stt_lang = first
+
+            report("[STT] 음성 → 텍스트 변환 중…")
+            stt_result = _run_stt(
+                audio_path,
+                model_size=stt_model_size,
+                language=stt_lang,
+                progress=lambda m: report(f"[STT] {m}"),
+                should_cancel=should_cancel,
+            )
         finally:
-            pass
-        audio_tmp = audio_path if not keep_audio else None
-
-        # Pick the STT source language from the preferred list (first entry),
-        # but only when it's a single-letter-base code Whisper understands.
-        stt_lang = None
-        if preferred_langs:
-            first = (preferred_langs[0] or "").split("-")[0].lower()
-            if first:
-                stt_lang = first
-
-        report("[STT] 음성 → 텍스트 변환 중…")
-        stt_result = _run_stt(
-            audio_path,
-            model_size=stt_model_size,
-            language=stt_lang,
-            progress=lambda m: report(f"[STT] {m}"),
-            should_cancel=should_cancel,
-        )
-
-        # Clean up the intermediate audio unless the user wants it kept.
-        if audio_tmp is not None:
-            try:
-                audio_tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
+            # Clean up the intermediate audio unless the user wants it kept.
+            # Doing this in `finally` guarantees the temp mp3 doesn't linger
+            # in out_dir even if STT raised — previously the unlink lived
+            # after the _run_stt call, so an exception would leak the file.
+            if audio_path is not None and not keep_audio:
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         if stt_result is None:
             raise ExtractionError(
@@ -1142,9 +1158,10 @@ def extract_to_markdown_with_fallback(
         include_timestamps=include_timestamps,
     )
     # STT-originated files get a distinct suffix so they don't masquerade as
-    # official YouTube captions when the user opens them later.
-    is_stt_origin = result.language.startswith("음성 인식")
-    lang_tag = ""
+    # official YouTube captions when the user opens them later. We key off
+    # result.origin ("stt" vs "youtube") rather than the language label, so
+    # the check survives translations of the "음성 인식" string.
+    is_stt_origin = result.origin == "stt"
     if is_stt_origin:
         base_name = safe_filename(meta.title, video_id)
         # Insert ".stt" before the [id] suffix.
@@ -1177,142 +1194,15 @@ def extract_to_markdown_with_fallback(
                 report(f"{target} 번역 자막을 사용할 수 없습니다 (원문만 저장)")
     return written
 
-def _ffprobe_download_url() -> str | None:
-    """Resolve the ffprobe download URL for the current platform from
-    ffbinaries.com's latest release.
-
-    ffprobe isn't shipped by imageio-ffmpeg (which bundles ffmpeg only), so
-    yt-dlp features that need it — ``download_ranges``, ``live_from_start``
-    with cuts, metadata probing — fail with "ffmpeg not installed". We fetch
-    ffprobe separately here. ffprobe is a self-contained binary (its own copy
-    of libavformat/libavcodec), so a minor version skew from the bundled
-    ffmpeg (7.x vs ffbinaries' 6.1) is fine for the metadata+cut use case.
-    Returns None on any failure so callers can surface a clear message.
-    """
-    import platform
-
-    machine = platform.machine().lower()
-    is_64 = ("64" in machine) or (platform.architecture()[0] == "64bit")
-    if platform.system().lower().startswith("win"):
-        plat = "windows-64" if is_64 else "windows-32"
-    elif platform.system().lower() == "darwin":
-        plat = "osx-64"
-    else:
-        plat = "linux-64" if is_64 else "linux-32"
-
-    try:
-        import requests
-        resp = requests.get(
-            "https://ffbinaries.com/api/v1/version/latest", timeout=15,
-            headers={"User-Agent": "YouTubeTranscriptExtractor"},
-        )
-        if resp.status_code != 200:
-            return None
-        entry = resp.json().get("bin", {}).get(plat, {})
-        return entry.get("ffprobe")
-    except Exception:
-        return None
-
-
-def _ensure_ffprobe(shim_dir: Path, *, on_progress=None,
-                    should_cancel=None) -> Path | None:
-    """Download+extract ffprobe into ``shim_dir`` if it's not already there.
-
-    Pulls a ZIP from ffbinaries.com (the URL from ``_ffprobe_download_url``),
-    writes the archive to a ``.zip.part`` file, then extracts just
-    ``ffprobe(.exe)`` to a ``.exe.part`` file and atomically renames on
-    success. This guarantees no half-written ffprobe ever looks valid — an
-    interrupted download/extraction leaves only ``.part`` files behind, which
-    the next call overwrites. Returns the path on success (cached or freshly
-    fetched), or None if the download couldn't be completed.
-    """
-    import shutil
-    import zipfile
-
-    is_win = os.name == "nt"
-    exe_name = "ffprobe.exe" if is_win else "ffprobe"
-    dst = shim_dir / exe_name
-    if dst.exists() and dst.stat().st_size > 0:
-        return dst  # cached
-
-    shim_dir.mkdir(parents=True, exist_ok=True)
-    # A previous interrupted run may have left a zero-byte or partial ffprobe
-    # (looks present but won't run). Remove it so we don't trust a bad file.
-    if dst.exists():
-        try:
-            dst.unlink()
-        except OSError:
-            pass
-
-    url = _ffprobe_download_url()
-    if not url:
-        return None
-
-    tmp_zip = shim_dir / "ffprobe.zip.part"
-    tmp_dst = shim_dir / (exe_name + ".part")
-    try:
-        import requests
-        headers = {"User-Agent": "YouTubeTranscriptExtractor"}
-        with requests.get(url, stream=True, timeout=60, headers=headers) as resp:
-            if resp.status_code != 200:
-                return None
-            total = int(resp.headers.get("Content-Length", 0))
-            done = 0
-            with open(tmp_zip, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1 << 20):
-                    if should_cancel and should_cancel():
-                        return None
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    done += len(chunk)
-                    if on_progress:
-                        on_progress(done, total)
-        # Extract only the ffprobe binary; the ZIP also contains ffmpeg/etc
-        # which we already have via imageio-ffmpeg, so we skip them.
-        with zipfile.ZipFile(tmp_zip) as zf:
-            member = None
-            for name in zf.namelist():
-                low = name.lower().rsplit("/", 1)[-1]
-                if low in ("ffprobe", "ffprobe.exe"):
-                    member = name
-                    break
-            if not member:
-                return None
-            with zf.open(member) as src_f, open(tmp_dst, "wb") as dst_f:
-                shutil.copyfileobj(src_f, dst_f, length=1 << 20)
-        if tmp_dst.stat().st_size == 0:
-            return None
-        # os.replace is atomic on the same filesystem: either the rename
-        # fully succeeds (dst becomes valid ffprobe) or it fails (dst stays
-        # absent — never half-written).
-        os.replace(tmp_dst, dst)
-    except Exception:
-        return None
-    finally:
-        tmp_zip.unlink(missing_ok=True)
-        tmp_dst.unlink(missing_ok=True)
-
-    return dst if (dst.exists() and dst.stat().st_size > 0) else None
-
-
-def _ffmpeg_location(*, ensure_ffprobe: bool = False,
-                     on_progress=None, should_cancel=None):
-    """Return a directory containing an ffmpeg binary yt-dlp can use, or None.
+def _ffmpeg_location():
+    """Return a directory containing an ffmpeg binary yt-dlp/ffmpeg can use,
+    or None.
 
     Prefers the binary bundled by imageio-ffmpeg so users don't have to install
     ffmpeg system-wide. That binary has a versioned name (e.g.
     ``ffmpeg-win-x86_64-v7.1.exe``) which yt-dlp won't recognise, so we copy it
     once into a cache dir under a plain ``ffmpeg``/``ffmpeg.exe`` name. Returns
     None to let yt-dlp fall back to whatever ffmpeg is on PATH.
-
-    When ``ensure_ffprobe`` is True, also download ffprobe into the same shim
-    directory if it's missing (imageio-ffmpeg ships ffmpeg only). This is
-    required by yt-dlp features that probe media metadata or cut at exact
-    timestamps — ``download_ranges``, ``live_from_start``+cuts. Without ffprobe
-    those fail with a misleading "ffmpeg is not installed" error. The download
-    is best-effort: on failure we still return the shim dir (ffmpeg-only is
-    enough for plain downloads), so the caller gets the best available setup.
 
     As a side effect, the returned directory is also prepended to ``PATH`` for
     the current process. yt-dlp's ``ffmpeg_location`` option is *not* consulted
@@ -1322,6 +1212,12 @@ def _ffmpeg_location(*, ensure_ffprobe: bool = False,
     Without our dir on PATH, ``download_ranges`` fails with "ffmpeg is not
     installed" even though ``ffmpeg_location`` points right at it. Adding it to
     PATH makes both detection paths agree.
+
+    Note on ffprobe: imageio-ffmpeg ships ffmpeg *only*, but none of our
+    current code paths need ffprobe — VOD audio extraction and the live-stream
+    ffmpeg capture both work with ffmpeg alone. If a future feature needs
+    ffprobe (e.g. precise timestamp cuts), add a separate fetch then; for now
+    it would be dead code.
     """
     import shutil
     import tempfile
@@ -1339,20 +1235,6 @@ def _ffmpeg_location(*, ensure_ffprobe: bool = False,
             shutil.copy2(src, dst)
     except Exception:
         return None  # let yt-dlp find ffmpeg on PATH
-
-    # ffprobe fetch is done OUTSIDE the try/except above for two reasons:
-    #   1. A failure to fetch ffprobe must not mask the ffmpeg path we just
-    #      resolved (the broad except above would have turned it into None).
-    #   2. On Windows, doing the ffprobe download/copy immediately after
-    #      shutil.copy2 of ffmpeg occasionally hits a transient file-lock that
-    #      corrupts the extraction. Separating the steps sidesteps that.
-    if ensure_ffprobe:
-        try:
-            _ensure_ffprobe(
-                shim_dir, on_progress=on_progress, should_cancel=should_cancel,
-            )
-        except Exception:
-            pass  # best-effort; ffmpeg-only is still usable for plain downloads
 
     # Prepend to PATH so yt-dlp's PATH-based detection (FFmpegFD.available and
     # FFmpegPostProcessor().available) also sees our ffmpeg, not just the

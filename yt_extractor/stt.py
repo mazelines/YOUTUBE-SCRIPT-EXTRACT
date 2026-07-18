@@ -13,6 +13,7 @@ unchanged for both real YouTube captions and STT-generated ones.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import requests
@@ -31,6 +32,16 @@ DEFAULT_STT_MODEL = "small"
 
 # Cached WhisperModel instances keyed by size — loading is expensive.
 _models: dict[str, object] = {}
+# Guards the _models dict so concurrent QThreadPool workers don't each kick
+# off a multi-GB WhisperModel load for the same size before any of them
+# finishes. With GUI default concurrency=4, four caption-less URLs submitted
+# together would otherwise load the model four times.
+_models_lock = threading.Lock()
+# Guards transcription calls: a single WhisperModel instance isn't guaranteed
+# thread-safe (CTranslate2 sessions share state), so we serialise transcribe
+# across workers. Inference is the slow step, so this effectively caps STT
+# throughput at 1 regardless of concurrency — but it's correct.
+_transcribe_lock = threading.Lock()
 
 
 def _data_dir() -> Path:
@@ -128,10 +139,13 @@ def download_model(size: str = DEFAULT_STT_MODEL,
     repo, _ = _hf_repo_for(size)
     if snapshot_download is not None:
         try:
+            # Note: ``local_dir_use_symlinks`` was removed in huggingface_hub
+            # >= 1.0 (it's the default behaviour when ``local_dir`` is set),
+            # so we don't pass it — older versions also accept its absence and
+            # default to copying.
             snapshot_download(
                 repo,
                 local_dir=str(model_path(size)),
-                local_dir_use_symlinks=False,
             )
             # Marker so is_model_present is fast next time even if HF cache
             # gets cleared.
@@ -198,30 +212,37 @@ def _get_model(size: str = DEFAULT_STT_MODEL):
     wrapped in try/except so a CUDA build that can't see a device still loads
     on CPU — same single-wheels-cover-both story as llama-cpp-python.
     """
+    # Fast path: already loaded. Checked outside the lock so the common case
+    # (model resident, several workers transcribing) doesn't serialise here.
     if size in _models:
         return _models[size]
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        raise STTError(
-            "STT 기능에 필요한 faster-whisper가 설치되어 있지 않습니다.\n"
-            "requirements-stt.txt의 안내대로 설치하세요 "
-            "(pip install -r requirements-stt.txt)."
-        )
-    if not is_model_present(size):
-        raise STTError(f"STT 모델({size})이 없습니다. 먼저 다운로드가 필요합니다.")
-
-    model_arg = _resolve_model_arg(size)
-    common = dict(device="cpu", compute_type="int8", cpu_threads=max(1, (os.cpu_count() or 4) - 1))
-    try:
-        m = WhisperModel(model_arg, device="cuda", compute_type="float16")
-    except Exception:
+    with _models_lock:
+        # Re-check inside the lock: another worker may have loaded it while we
+        # were waiting. This is the double-checked locking pattern.
+        if size in _models:
+            return _models[size]
         try:
-            m = WhisperModel(model_arg, **common)
-        except Exception as e:
-            raise STTError(f"STT 모델 로딩 실패: {e}")
-    _models[size] = m
-    return m
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise STTError(
+                "STT 기능에 필요한 faster-whisper가 설치되어 있지 않습니다.\n"
+                "requirements-stt.txt의 안내대로 설치하세요 "
+                "(pip install -r requirements-stt.txt)."
+            )
+        if not is_model_present(size):
+            raise STTError(f"STT 모델({size})이 없습니다. 먼저 다운로드가 필요합니다.")
+
+        model_arg = _resolve_model_arg(size)
+        common = dict(device="cpu", compute_type="int8", cpu_threads=max(1, (os.cpu_count() or 4) - 1))
+        try:
+            m = WhisperModel(model_arg, device="cuda", compute_type="float16")
+        except Exception:
+            try:
+                m = WhisperModel(model_arg, **common)
+            except Exception as e:
+                raise STTError(f"STT 모델 로딩 실패: {e}")
+        _models[size] = m
+        return m
 
 
 def transcribe_audio(audio_path: str | Path,
@@ -244,39 +265,45 @@ def transcribe_audio(audio_path: str | Path,
     except STTError:
         raise
 
-    try:
-        segments, info = model.transcribe(
-            str(audio_path),
-            language=language,
-            task="transcribe",
-            beam_size=5,
-            vad_filter=True,           # skip silence (live dead-air, intros)
-            vad_parameters=dict(
-                min_silence_duration_ms=500,
-                speech_pad_ms=200,
-            ),
-            without_timestamps=False,
-        )
-    except Exception as e:
-        raise STTError(f"STT 변환 시작 실패: {e}")
+    # Serialise transcription across workers. faster-whisper's WhisperModel is
+    # not documented as thread-safe (CTranslate2 sessions share internal state),
+    # so concurrent transcribe() calls on one cached model could race. This
+    # caps effective STT parallelism at 1, which is fine — inference is the
+    # bottleneck, not I/O, and model load is already serialised by _models_lock.
+    with _transcribe_lock:
+        try:
+            segments, info = model.transcribe(
+                str(audio_path),
+                language=language,
+                task="transcribe",
+                beam_size=5,
+                vad_filter=True,           # skip silence (live dead-air, intros)
+                vad_parameters=dict(
+                    min_silence_duration_ms=500,
+                    speech_pad_ms=200,
+                ),
+                without_timestamps=False,
+            )
+        except Exception as e:
+            raise STTError(f"STT 변환 시작 실패: {e}")
 
-    # faster-whisper returns a *generator*; iteration does the actual work, so
-    # we walk it here and surface progress + cancellation per segment.
-    snippets: list[tuple[str, float, float]] = []
-    try:
-        for i, seg in enumerate(segments):
-            if should_cancel and should_cancel():
-                raise STTError("STT 변환이 취소되었습니다.")
-            text = (seg.text or "").strip()
-            if not text:
-                continue
-            snippets.append((text, float(seg.start), float(seg.end - seg.start)))
-            if on_progress:
-                on_progress(i + 1)
-    except STTError:
-        raise
-    except Exception as e:
-        raise STTError(f"STT 변환 중 오류: {e}")
+        # faster-whisper returns a *generator*; iteration does the actual work,
+        # so we walk it here and surface progress + cancellation per segment.
+        snippets: list[tuple[str, float, float]] = []
+        try:
+            for i, seg in enumerate(segments):
+                if should_cancel and should_cancel():
+                    raise STTError("STT 변환이 취소되었습니다.")
+                text = (seg.text or "").strip()
+                if not text:
+                    continue
+                snippets.append((text, float(seg.start), float(seg.end - seg.start)))
+                if on_progress:
+                    on_progress(i + 1)
+        except STTError:
+            raise
+        except Exception as e:
+            raise STTError(f"STT 변환 중 오류: {e}")
 
     return snippets
 
