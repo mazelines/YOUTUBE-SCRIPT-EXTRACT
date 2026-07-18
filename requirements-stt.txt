@@ -1,0 +1,17 @@
+# Optional: STT 폴백 (자막 없는 영상 / 라이브 영상 처리).
+# llama-cpp-python(AI 채팅)과 마찬가지로 핵심 설치에 불필요 — STT 기능을
+# 원할 때만 별도로 설치하세요:
+#
+#     pip install -r requirements-stt.txt
+#
+# 자막이 없는 VOD 또는 자막 생성 전 라이브 영상에서 음성을 다운로드해
+# faster-whisper(CTranslate2 기반 Whisper)로 텍스트를 생성합니다.
+# 첫 사용 시 선택한 모델(tiny/base/small/medium/large-v3)을 Hugging Face에서
+# 받아 %LOCALAPPDATA%/YouTubeTranscriptExtractor/stt-models 아래에 캐싱합니다.
+#
+# - GPU(CUDA)가 있으면 자동으로 float16 추론을 사용하고, 없으면 CPU int8로
+#   동작합니다 (llama-cpp-python과 동일한 one-install-covers-both 구조).
+# - STT용 음성 다운로드는 핵심 yt-dlp + imageio-ffmpeg로 처리하므로 추가
+#   의존성 없이 동작합니다.
+
+faster-whisper>=1.0.3

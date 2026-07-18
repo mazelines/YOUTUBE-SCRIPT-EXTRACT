@@ -26,6 +26,8 @@ design_handoff_lime_forward/
 
 .agents/
 
+.zcode/
+
 tests/
 
 *.log

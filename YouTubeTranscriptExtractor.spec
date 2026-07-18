@@ -37,6 +37,20 @@ try:
 except Exception:
     pass
 
+# STT fallback (faster-whisper): same optional-dep pattern as llama_cpp. Only
+# bundled when installed. The Whisper checkpoint is NOT bundled — downloaded
+# from Hugging Face on first use. CTranslate2 is faster-whisper's inference
+# backend and ships its own native libs, so collect those too.
+try:
+    binaries += collect_dynamic_libs("faster_whisper")
+    datas += collect_data_files("faster_whisper")
+    hiddenimports += collect_submodules("faster_whisper")
+    binaries += collect_dynamic_libs("ctranslate2")
+    datas += collect_data_files("ctranslate2")
+    hiddenimports += collect_submodules("ctranslate2")
+except Exception:
+    pass
+
 a = Analysis(
     ["run.py"],
     pathex=[],
