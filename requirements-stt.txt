@@ -15,3 +15,17 @@
 #   의존성 없이 동작합니다.
 
 faster-whisper>=1.0.3
+
+# GPU 가속 (선택). NVIDIA GPU가 있는 머신에서만 설치하세요 — medium/large-v3
+# 모델 기준 CPU 대비 5-15배 빠릅니다 (4090 벤치마크: medium 모델 12.5x).
+# small 모델은 CPU int8이 오히려 더 빠르니 GPU 패키지가 필요 없습니다.
+#
+# 이 패키지들은 cublas64_12.dll, cudnn64_9.dll, nvrtc DLL을 site-packages/nvidia/
+# 아래에 받습니다. yt_extractor.stt._ensure_cuda_dlls()가 시작 시 이 경로를
+# PATH/DLL 검색 경로에 자동 등록하므로 별도 설정 없이 GPU로 동작합니다.
+# 설치하지 않으면 자동으로 CPU int8으로 폴백합니다.
+#
+# 주의: 약 600MB 추가. CPU-only 머신에서는 의미 없음.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.5.0.50
+nvidia-cuda-nvrtc-cu12==12.4.127

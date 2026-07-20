@@ -235,17 +235,83 @@ def _resolve_model_arg(size: str) -> str:
     return size
 
 
+# Cached result of the CUDA-DLL probe so we only scan site-packages once.
+_cuda_dlls_ok: bool | None = None
+
+
+def _ensure_cuda_dlls() -> bool:
+    """Locate NVIDIA CUDA DLLs (cublas/cudnn/nvrtc) installed via pip wheels
+    and expose them to ctranslate2. Returns True if the required DLLs look
+    present, False if CUDA can't be made to work (caller falls back to CPU).
+
+    ctranslate2 loads ``cublas64_12.dll`` etc. via LoadLibrary, which on
+    Windows searches PATH + os.add_dll_directory() targets — it does NOT
+    search inside ``site-packages/nvidia/...`` automatically. The
+    ``nvidia-cublas-cu12`` (and cudnn/nvrtc) pip packages drop the DLLs
+    exactly there, so we have to register those bin dirs ourselves.
+
+    Idempotent: the result is memoised in ``_cuda_dlls_ok`` so the directory
+    scan happens only once per process.
+    """
+    global _cuda_dlls_ok
+    if _cuda_dlls_ok is not None:
+        return _cuda_dlls_ok
+
+    try:
+        import importlib.util
+
+        # Find site-packages by looking up any pip-installed dist.
+        # importlib.util.find_spec on a stdlib module gives its origin; we
+        # actually want the *site-packages* dir, which we get from the
+        # nvidia namespace package if it exists.
+        import importlib
+        spec = importlib.util.find_spec("faster_whisper")
+        if spec is None or not spec.submodule_search_locations:
+            _cuda_dlls_ok = False
+            return False
+        site_packages = list(spec.submodule_search_locations)[0]
+        nvidia_root = Path(site_packages).parent / "nvidia"
+
+        added = 0
+        for sub in ("cublas", "cudnn", "cuda_nvrtc"):
+            bin_dir = nvidia_root / sub / "bin"
+            if not bin_dir.is_dir():
+                continue
+            # os.add_dll_directory is the modern (3.8+) way and is required
+            # because PATH-only discovery is unreliable for subprocess-launched
+            # Python. We also prepend to PATH as belt-and-suspenders.
+            try:
+                os.add_dll_directory(str(bin_dir.resolve()))
+            except (OSError, FileNotFoundError):
+                pass
+            os.environ["PATH"] = (
+                str(bin_dir.resolve()) + os.pathsep + os.environ.get("PATH", "")
+            )
+            added += 1
+        # Need all three (cublas + cudnn + nvrtc) to trust cuda float16.
+        _cuda_dlls_ok = added >= 3
+    except Exception:
+        _cuda_dlls_ok = False
+    return _cuda_dlls_ok
+
+
+
 def _get_model(size: str = DEFAULT_STT_MODEL):
     """Load (once per size) and return a faster-whisper WhisperModel.
 
-    Defaults to CPU int8 — the safest device/compute combo across user
-    machines. CUDA is opt-in via the ``STT_USE_CUDA=1`` env var. The naive
-    "try cuda, fall back to cpu" pattern is unsafe for faster-whisper:
-    ``WhisperModel(device="cuda")`` often succeeds at construction (the CUDA
-    context is lazy) and only fails inside ``transcribe()`` with a DLL load
-    error like "cublas64_12.dll is not found" — past our fallback point. A
-    partially-installed CUDA toolkit (driver present, cuBLAS missing — common
-    on gaming GPUs) reliably hits this, so we don't gamble by default.
+    Device selection:
+    * If ``STT_USE_CUDA`` env var is set (1/true/yes): force CUDA float16.
+    * If ``STT_USE_CUDA=0`` (or "false"/"no"): force CPU int8.
+    * Otherwise: auto-detect. Use CUDA when the cublas/cudnn/nvrtc DLLs are
+      installed (via the nvidia-*-cu12 pip wheels) — that's a 5-15x speedup
+      for medium+ models on a discrete GPU. Fall back to CPU int8 otherwise.
+
+    The naive "try cuda, catch at construction" pattern is unsafe for
+    faster-whisper: ``WhisperModel(device="cuda")`` succeeds at construction
+    (lazy CUDA context) and only fails inside ``transcribe()`` with a DLL
+    load error like "cublas64_12.dll is not found" — past our fallback point.
+    So we probe the DLLs explicitly with ``_ensure_cuda_dlls`` before
+    attempting cuda, rather than catching the construction error.
     """
     # Fast path: already loaded. Checked outside the lock so the common case
     # (model resident, several workers transcribing) doesn't serialise here.
@@ -270,31 +336,32 @@ def _get_model(size: str = DEFAULT_STT_MODEL):
         model_arg = _resolve_model_arg(size)
         threads = max(1, (os.cpu_count() or 4) - 1)
 
-        # Default to CPU int8 — the safest device/compute combo across user
-        # machines. CUDA is opt-in via the STT_USE_CUDA env var because the
-        # naive "try cuda, fall back to cpu" pattern is unsafe here:
-        # WhisperModel(device="cuda") often succeeds at construction time
-        # (lazy CUDA context) and only fails inside transcribe() with a DLL
-        # load error like "cublas64_12.dll is not found" — past our fallback
-        # point. A partially-installed CUDA toolkit (driver but no cuBLAS,
-        # common on gaming GPUs) reliably hits this, so we don't gamble.
-        # Users who know they have a full CUDA setup set STT_USE_CUDA=1.
-        cpu_kwargs = dict(device="cpu", compute_type="int8", cpu_threads=threads)
-        use_cuda = os.environ.get("STT_USE_CUDA", "").lower() in ("1", "true", "yes")
-        if use_cuda:
+        # Decide cuda vs cpu BEFORE constructing WhisperModel — see docstring.
+        cuda_pref = os.environ.get("STT_USE_CUDA", "").lower()
+        if cuda_pref in ("0", "false", "no"):
+            want_cuda = False
+        elif cuda_pref in ("1", "true", "yes"):
+            want_cuda = True
+        else:
+            want_cuda = _ensure_cuda_dlls()
+
+        if want_cuda:
             try:
                 m = WhisperModel(model_arg, device="cuda", compute_type="float16")
                 _models[size] = m
                 return m
             except Exception as e:
-                # Fall through to CPU; the cuda load failure is non-fatal but
-                # worth surfacing once via the model's first use.
+                # DLL probe said cuda should work but model load still failed
+                # (e.g. out-of-VRAM, driver/runtime mismatch). Surface once
+                # and fall through to CPU so STT still completes.
                 import warnings
                 warnings.warn(
-                    f"STT_USE_CUDA=1이지만 CUDA 로딩 실패, CPU로 전환: {e}"
+                    f"CUDA 로딩 실패, CPU로 전환: {e}"
                 )
         try:
-            m = WhisperModel(model_arg, **cpu_kwargs)
+            m = WhisperModel(
+                model_arg, device="cpu", compute_type="int8", cpu_threads=threads,
+            )
         except Exception as e:
             raise STTError(f"STT 모델 로딩 실패: {e}")
         _models[size] = m
@@ -333,11 +400,15 @@ def transcribe_audio(audio_path: str | Path,
                 language=language,
                 task="transcribe",
                 beam_size=5,
-                vad_filter=True,           # skip silence (live dead-air, intros)
-                vad_parameters=dict(
-                    min_silence_duration_ms=500,
-                    speech_pad_ms=200,
-                ),
+                # VAD is OFF. faster-whisper ships Silero VAD, which is trained
+                # on conversational speech — it classifies *singing* (music,
+                # songs, melodic speech) as non-speech and filters it out, so
+                # music videos / lyric videos / live concert streams produced
+                # zero segments with vad_filter=True. Whisper itself handles
+                # silence well via its own attention, so the VAD trade-off
+                # (skip silence vs. drop singing) isn't worth it for the
+                # general YouTube corpus this app targets.
+                vad_filter=False,
                 without_timestamps=False,
             )
         except Exception as e:
