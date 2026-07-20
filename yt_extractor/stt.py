@@ -13,6 +13,7 @@ unchanged for both real YouTube captions and STT-generated ones.
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from pathlib import Path
 
@@ -117,6 +118,18 @@ def is_model_present(size: str = DEFAULT_STT_MODEL) -> bool:
     return False
 
 
+def _purge_model_dir(dest: Path) -> None:
+    """Remove a (possibly partial) model directory so the next download starts
+    clean. Best-effort: any failure is swallowed because this runs from error
+    paths where raising would mask the original problem.
+    """
+    try:
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def download_model(size: str = DEFAULT_STT_MODEL,
                    on_progress=None, should_cancel=None) -> None:
     """Download a Whisper checkpoint via huggingface_hub if available.
@@ -138,21 +151,40 @@ def download_model(size: str = DEFAULT_STT_MODEL,
 
     repo, _ = _hf_repo_for(size)
     if snapshot_download is not None:
+        # Clean up any partial download from a previous failed attempt before
+        # re-running — huggingface_hub can leave config.json etc. behind on a
+        # network timeout, then on the *next* call report "already downloaded"
+        # and let our marker touch succeed even though model.bin is missing.
+        # _purge_model_dir is best-effort and never raises.
+        dest = model_path(size)
         try:
             # Note: ``local_dir_use_symlinks`` was removed in huggingface_hub
             # >= 1.0 (it's the default behaviour when ``local_dir`` is set),
             # so we don't pass it — older versions also accept its absence and
             # default to copying.
-            snapshot_download(
-                repo,
-                local_dir=str(model_path(size)),
-            )
-            # Marker so is_model_present is fast next time even if HF cache
-            # gets cleared.
-            (model_path(size) / "model.bin").touch(exist_ok=True)
-            return
+            snapshot_download(repo, local_dir=str(dest))
         except Exception as e:
+            # snapshot_download may have written a partial tree; remove it so
+            # the next attempt starts clean instead of resuming into a broken
+            # state.
+            _purge_model_dir(dest)
             raise STTError(f"STT 모델 다운로드 실패: {e}")
+        # Verify the real model weight actually landed before trusting the
+        # directory. snapshot_download can return without raising even when
+        # only some files were fetched (resume-from-cache quirks), in which
+        # case touching a marker would later make is_model_present lie and
+        # _get_model would segfault on the missing model.bin.
+        bin_path = dest / "model.bin"
+        if not bin_path.exists() or bin_path.stat().st_size == 0:
+            _purge_model_dir(dest)
+            raise STTError(
+                f"STT 모델 다운로드가 불완전합니다 (model.bin 누락). "
+                "네트워크 상태를 확인하고 다시 시도하세요."
+            )
+        # Marker so is_model_present is fast next time even if HF cache
+        # gets cleared. Only created after the integrity check above passed.
+        bin_path.touch(exist_ok=True)
+        return
 
     # Fallback: stream model.bin only. Good enough for a self-contained run,
     # though faster-whisper may re-fetch tokenizer config on first load.

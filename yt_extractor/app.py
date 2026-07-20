@@ -1304,14 +1304,26 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _on_stt_probe(self, available: bool):
-        self._stt_available = bool(available)
-        if not self._stt_available:
-            self.stt_cb.setChecked(False)
-            self.stt_cb.setToolTip(
-                "faster-whisper가 설치되어 있지 않아 STT 폴백을 사용할 수 없습니다.\n"
-                "설치: pip install -r requirements-stt.txt"
-            )
-        self._sync_output_controls()
+        # The probe runs on a background thread; the user may close the window
+        # while it's still importing faster-whisper (slow on a cold HDD). By
+        # the time the queued `done` signal is delivered, either this MainWindow
+        # or one of the widgets below can already be torn down — accessing them
+        # raises RuntimeError ("wrapped C/C++ object of type X has been
+        # deleted") or, worse, aborts the process from PySide6 internals.
+        # Guard every widget touch so a late probe result never crashes exit.
+        try:
+            self._stt_available = bool(available)
+            if not self._stt_available:
+                self.stt_cb.setChecked(False)
+                self.stt_cb.setToolTip(
+                    "faster-whisper가 설치되어 있지 않아 STT 폴백을 사용할 수 없습니다.\n"
+                    "설치: pip install -r requirements-stt.txt"
+                )
+            self._sync_output_controls()
+        except RuntimeError:
+            # Window/widgets already destroyed by shutdown — drop the late
+            # probe result silently.
+            pass
 
     def _set_status_item(self, row: int, status: str):
         item = QTableWidgetItem(status)
@@ -1627,6 +1639,18 @@ class MainWindow(QMainWindow):
         # own pool (and its own download/inference worker), so drain both.
         self._shutdown.set()
         self.pool.clear()
+        # Disconnect the STT probe signal proactively: a probe worker may still
+        # be importing faster-whisper when the window closes, and its queued
+        # `done` emit would otherwise land on a torn-down MainWindow. Even
+        # though _on_stt_probe guards with try/except, dropping the connection
+        # here means the emit becomes a no-op instead of relying on the slot
+        # to catch the fallout. Best-effort — the signal/widget may already be
+        # gone if closeEvent fires twice.
+        try:
+            if getattr(self, "_stt_probe_sig", None) is not None:
+                self._stt_probe_sig.done.disconnect(self._on_stt_probe)
+        except (RuntimeError, AttributeError):
+            pass
         event.accept()
         ext_done = self.pool.waitForDone(4000)
         chat_done = self.chat.shutdown(timeout=4000)
