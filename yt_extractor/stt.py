@@ -238,11 +238,14 @@ def _resolve_model_arg(size: str) -> str:
 def _get_model(size: str = DEFAULT_STT_MODEL):
     """Load (once per size) and return a faster-whisper WhisperModel.
 
-    Picks ``device``/``compute_type`` automatically: CUDA-capable builds run on
-    the GPU with float16; everything else runs on CPU with int8 (the fastest
-    CPU compute_type without quantisation-time artefacts). The GPU attempt is
-    wrapped in try/except so a CUDA build that can't see a device still loads
-    on CPU — same single-wheels-cover-both story as llama-cpp-python.
+    Defaults to CPU int8 — the safest device/compute combo across user
+    machines. CUDA is opt-in via the ``STT_USE_CUDA=1`` env var. The naive
+    "try cuda, fall back to cpu" pattern is unsafe for faster-whisper:
+    ``WhisperModel(device="cuda")`` often succeeds at construction (the CUDA
+    context is lazy) and only fails inside ``transcribe()`` with a DLL load
+    error like "cublas64_12.dll is not found" — past our fallback point. A
+    partially-installed CUDA toolkit (driver present, cuBLAS missing — common
+    on gaming GPUs) reliably hits this, so we don't gamble by default.
     """
     # Fast path: already loaded. Checked outside the lock so the common case
     # (model resident, several workers transcribing) doesn't serialise here.
@@ -265,14 +268,35 @@ def _get_model(size: str = DEFAULT_STT_MODEL):
             raise STTError(f"STT 모델({size})이 없습니다. 먼저 다운로드가 필요합니다.")
 
         model_arg = _resolve_model_arg(size)
-        common = dict(device="cpu", compute_type="int8", cpu_threads=max(1, (os.cpu_count() or 4) - 1))
-        try:
-            m = WhisperModel(model_arg, device="cuda", compute_type="float16")
-        except Exception:
+        threads = max(1, (os.cpu_count() or 4) - 1)
+
+        # Default to CPU int8 — the safest device/compute combo across user
+        # machines. CUDA is opt-in via the STT_USE_CUDA env var because the
+        # naive "try cuda, fall back to cpu" pattern is unsafe here:
+        # WhisperModel(device="cuda") often succeeds at construction time
+        # (lazy CUDA context) and only fails inside transcribe() with a DLL
+        # load error like "cublas64_12.dll is not found" — past our fallback
+        # point. A partially-installed CUDA toolkit (driver but no cuBLAS,
+        # common on gaming GPUs) reliably hits this, so we don't gamble.
+        # Users who know they have a full CUDA setup set STT_USE_CUDA=1.
+        cpu_kwargs = dict(device="cpu", compute_type="int8", cpu_threads=threads)
+        use_cuda = os.environ.get("STT_USE_CUDA", "").lower() in ("1", "true", "yes")
+        if use_cuda:
             try:
-                m = WhisperModel(model_arg, **common)
+                m = WhisperModel(model_arg, device="cuda", compute_type="float16")
+                _models[size] = m
+                return m
             except Exception as e:
-                raise STTError(f"STT 모델 로딩 실패: {e}")
+                # Fall through to CPU; the cuda load failure is non-fatal but
+                # worth surfacing once via the model's first use.
+                import warnings
+                warnings.warn(
+                    f"STT_USE_CUDA=1이지만 CUDA 로딩 실패, CPU로 전환: {e}"
+                )
+        try:
+            m = WhisperModel(model_arg, **cpu_kwargs)
+        except Exception as e:
+            raise STTError(f"STT 모델 로딩 실패: {e}")
         _models[size] = m
         return m
 

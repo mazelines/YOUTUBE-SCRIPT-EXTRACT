@@ -1080,7 +1080,7 @@ def extract_to_markdown_with_fallback(
             _stt_available = False
         if not _stt_available:
             raise ExtractionError(
-                "자막이 없습니다. STT 폴백을 사용하려면 faster-whisper 설치이 "
+                "자막이 없습니다. STT 폴백을 사용하려면 faster-whisper 설치가 "
                 "필요합니다: pip install -r requirements-stt.txt"
             )
 
@@ -1093,6 +1093,27 @@ def extract_to_markdown_with_fallback(
                 "캡처 시간(분)을 지정하면 일부 구간을 STT로 변환할 수 있고, "
                 "라이브 종료 후 다시 시도하면 전체 자막을 받을 수 있습니다."
             )
+
+        # Ensure the Whisper checkpoint exists BEFORE downloading the audio:
+        # if the model fetch fails we don't want to have wasted time/bandwidth
+        # on audio we then can't transcribe. The first run pulls the model
+        # (~480MB for 'small') with progress reported through the same channel
+        # as everything else. Subsequent runs hit the cache and skip this.
+        try:
+            from . import stt as _stt_mod
+            if not _stt_mod.is_model_present(stt_model_size):
+                report(
+                    f"[STT] 모델({stt_model_size}) 다운로드 중… (최초 1회, "
+                    f"이후 캐시 사용)"
+                )
+                _stt_mod.download_model(
+                    stt_model_size,
+                    should_cancel=should_cancel,
+                )
+        except _stt_mod.STTError as e:
+            raise ExtractionError(str(e))
+        except Exception as e:
+            raise ExtractionError(f"STT 모델 준비 실패: {e}")
 
         report("[STT] 음성 다운로드 중…")
         audio_path: Path | None = None

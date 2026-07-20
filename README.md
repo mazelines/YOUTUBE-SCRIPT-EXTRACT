@@ -66,8 +66,9 @@ llama-cpp-python과 마찬가지로 **선택 의존성**입니다. 설치하지 
 pip install -r requirements-stt.txt
 ```
 
-- 첫 사용 시 선택한 모델(`tiny`/`base`/`small`/`medium`/`large-v3`)을 Hugging Face에서 내려받아 `%LOCALAPPDATA%\YouTubeTranscriptExtractor\stt-models`에 캐싱합니다. 이후 오프라인 동작.
-- **GPU 가속**: CUDA 가능 환경에서는 `float16`, 그 외에는 CPU `int8`로 자동 선택됩니다 (llama-cpp-python과 동일한 one-install 구조).
+- 첫 사용 시 STT 체크박스를 켜고 추출을 시작하면, 선택한 모델(`tiny`/`base`/`small`/`medium`/`large-v3`)을 Hugging Face에서 자동으로 내려받아 `%LOCALAPPDATA%\YouTubeTranscriptExtractor\stt-models`에 캐싱합니다. 이후 오프라인 동작.
+- **기본은 CPU `int8`**입니다. 빠르고 의존성이 없어 어느 머신에서나 동작합니다.
+- **GPU 가속 (선택)**: CUDA 툴킷이 완전히 설치된 환경에서만 `STT_USE_CUDA=1` 환경변수를 설정하세요. 드라이버만 있고 cuBLAS DLL이 없는 부분 설치 환경(게이밍 GPU에서 흔함)에서는 faster-whisper가 `transcribe()` 시점에 `cublas64_12.dll is not found` 에러를 내므로, 기본은 CPU로 안전하게 동작합니다.
 - **VAD 필터**: 무음 구간을 자동 제거해 라이브 데드타임·인트로 잡음에 강합니다.
 - **성능 가이드**: 1시간 라이브 기준, `small` 모델 CPU 약 5~10분 / GPU 1~2분. 정확도가 더 필요하면 `medium`으로 올리세요.
 
