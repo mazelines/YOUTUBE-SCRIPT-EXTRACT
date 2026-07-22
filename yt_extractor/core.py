@@ -144,7 +144,7 @@ class TranscriptResult:
     is_generated: bool
     snippets: list = field(default_factory=list)  # list of (text, start, duration)
     # Where the captions came from: "youtube" (official/auto-caption) or
-    # "stt" (faster-whisper on captured audio). Lets the markdown builder
+    # "stt" (whisper.cpp on captured audio). Lets the markdown builder
     # decide the output suffix (".stt.md" vs ".md") without string-matching
     # the language label, which is fragile under localisation.
     origin: str = "youtube"
@@ -741,7 +741,7 @@ def is_live_video(video_id: str, timeout: float = 8.0) -> bool:
 
 
 # MP3 bitrate for STT-bound audio. Speech recognition gains nothing from
-# higher bitrates, so we keep STT downloads small to bound the faster-whisper
+# higher bitrates, so we keep STT downloads small to bound the Whisper
 # input size and the live-capture file growth.
 STT_AUDIO_BITRATE = "128"
 
@@ -960,9 +960,9 @@ def _run_stt(
     progress=None,
     should_cancel=None,
 ) -> TranscriptResult | None:
-    """Invoke faster-whisper on ``audio_path`` and wrap the output in a
-    TranscriptResult. Returns ``None`` (not raises) when faster-whisper isn't
-    installed — the caller decides how to surface that.
+    """Invoke the Whisper STT engine (pywhispercpp) on ``audio_path`` and wrap
+    the output in a TranscriptResult. Returns ``None`` (not raises) when the
+    STT backend isn't installed — the caller decides how to surface that.
     """
     try:
         from .stt import transcribe_audio, STTError
@@ -1025,10 +1025,10 @@ def extract_to_markdown_with_fallback(
            b. Live + capture = 0 -> raise (caller shows "try after stream").
            c. VOD -> full audio download, then STT.
 
-    STT requires faster-whisper; if it's missing the function raises an
-    ExtractionError explaining how to install it, rather than silently
-    producing nothing. Returns 1-2 written paths (original + translation when
-    ``translate_to`` is set).
+    STT requires pywhispercpp (whisper.cpp); if it's missing the function
+    raises an ExtractionError explaining how to install it, rather than
+    silently producing nothing. Returns 1-2 written paths (original +
+    translation when ``translate_to`` is set).
     """
     def report(msg):
         if progress:
@@ -1080,8 +1080,8 @@ def extract_to_markdown_with_fallback(
             _stt_available = False
         if not _stt_available:
             raise ExtractionError(
-                "자막이 없습니다. STT 폴백을 사용하려면 faster-whisper 설치가 "
-                "필요합니다: pip install -r requirements-stt.txt"
+                "자막이 없습니다. STT 폴백을 사용하려면 pywhispercpp 설치가 "
+                "필요합니다: requirements-stt.txt의 안내를 참고하세요."
             )
 
         # Live requires a capture window; detect once here so we can give the

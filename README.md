@@ -13,7 +13,7 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 - **MP3 음원 추출** — yt-dlp + 동봉 ffmpeg로 음원만 추출 (128 / 192 / 320 kbps)
 - **MP4 영상 다운로드** — 화질 선택(1080p / 720p / 원본), H.264 우선으로 어느 플레이어에서나 재생 (재인코딩 없이 mp4 컨테이너로 remux)
 - **언어 우선순위** — 예: `ko, en, ja` 순으로 자막 탐색, 수동 자막 우선/번역 폴백
-- **라이브 영상 / 자막 없는 영상 지원** — 자막이 없을 때 (1) YouTube 자동 자막 생성 대기(폴링), (2) faster-whisper STT로 자동 자막 생성 중 택일. 라이브 중인 영상은 지정한 시간만큼 캡처해 변환 ([STT 폴백](#stt-폴백--라이브-영상-지원) 참고)
+- **라이브 영상 / 자막 없는 영상 지원** — 자막이 없을 때 (1) YouTube 자동 자막 생성 대기(폴링), (2) 내장 Whisper(whisper.cpp) STT로 자동 자막 생성 중 택일. 라이브 중인 영상은 지정한 시간만큼 캡처해 변환 ([STT 폴백](#stt-폴백--라이브-영상-지원) 참고)
 - **실시간 진행 표시** — 각 작업의 상태/진행/저장 파일을 표로 확인, 더블클릭으로 파일 열기
 - **스플래시 화면** — 앱 시작 시 3초간 로딩 화면 표시
 - **자동 업데이트 확인** — 시작 시 백그라운드로 최신 버전 확인
@@ -45,12 +45,12 @@ pip install "llama-cpp-python>=0.3.0" --no-binary llama-cpp-python --no-cache-di
 YouTube가 아직 자막을 만들지 않은 **라이브 중인 영상**이나 **자막이 비활성화된 VOD**에서도 자막을 얻을 수 있습니다. 두 단계 폴백이 순차적으로 동작합니다.
 
 1. **자막 생성 대기(폴링)** — YouTube가 곧 자동 자막을 만들 경우를 대비해, 지정한 시간(기본 0분 — 끄짐) 동안 1분 간격으로 재시도합니다. 라이브가 곧 자막을 켤 것 같을 때만 값을 올립니다.
-2. **STT 자동 생성** — 폴링까지 실패하면 음성을 내려받아 [faster-whisper](https://github.com/SYSTRAN/faster-whisper)로 텍스트를 생성합니다. 결과는 `.stt.md` 접미사로 저장되어 YouTube 공식 자막과 구분됩니다.
+2. **STT 자동 생성** — 폴링까지 실패하면 음성을 내려받아 [whisper.cpp](https://github.com/ggerganov/whisper.cpp)([pywhispercpp](https://github.com/absadiki/pywhispercpp) 바인딩)로 텍스트를 생성합니다. 결과는 `.stt.md` 접미사로 저장되어 YouTube 공식 자막과 구분됩니다.
 
 | 상황 | 동작 |
 |------|------|
 | VOD + 자막 있음 | 기존처럼 자막 추출 (가장 우선) |
-| VOD + 자막 없음 + STT 켬 | 음성 전체 다운로드 → faster-whisper 변환 |
+| VOD + 자막 없음 + STT 켬 | 음성 전체 다운로드 → Whisper 변환 |
 | 라이브 + 자막 있음 | 기존처럼 자막 추출 |
 | 라이브 + 자막 없음 + 폴링만 | 자막 생성 시점까지 주기적 재시도 |
 | 라이브 + 자막 없음 + STT + 캡처시간 > 0 | 시작부터 N분 구간을 캡처해 STT로 변환 |
@@ -58,30 +58,24 @@ YouTube가 아직 자막을 만들지 않은 **라이브 중인 영상**이나 *
 
 > **주의**: 라이브 캡처는 yt-dlp의 `--live-from-start`를 사용하며, YouTube 정책에 따라 실패할 수 있습니다. 라이브 종료 후 처리하는 편이 가장 안정적입니다.
 
-### faster-whisper 설치 (STT 폴백 사용 시)
+### STT 구성요소 설치 (pywhispercpp, STT 폴백 사용 시)
 
 llama-cpp-python과 마찬가지로 **선택 의존성**입니다. 설치하지 않아도 자막/MP3/MP4 추출은 그대로 동작하며, STT 옵션만 비활성화됩니다.
 
-```bash
-pip install -r requirements-stt.txt
-```
+STT 엔진은 AI 채팅(llama.cpp)과 **같은 ggml 스택**인 whisper.cpp입니다. Vulkan 소스 빌드 하나로 **NVIDIA/AMD/Intel 모든 GPU**가 가속되고, GPU가 없으면 자동으로 AVX2 CPU 백엔드로 동작합니다 — CUDA 전용 휠(~600MB)이 필요 없습니다. 빌드 절차는 `requirements-stt.txt`의 주석을 참고하세요 (llama-cpp-python Vulkan 빌드와 동일한 패턴). GPU 가속 없이 CPU만 쓸 거라면 `pip install -r requirements-stt.txt`(PyPI CPU 휠)로 충분합니다.
 
-- 첫 사용 시 STT 체크박스를 켜고 추출을 시작하면, 선택한 모델(`tiny`/`base`/`small`/`medium`/`large-v3`)을 Hugging Face에서 자동으로 내려받아 `%LOCALAPPDATA%\YouTubeTranscriptExtractor\stt-models`에 캐싱합니다. 이후 오프라인 동작.
-- **CPU가 기본**입니다. 어느 머신에서나 의존성 없이 동작합니다.
-- **GPU 가속 (자동 감지)**: `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` / `nvidia-cuda-nvrtc-cu12` 패키지가 설치된 환경(NVIDIA GPU)에서는 자동으로 CUDA `float16`으로 전환됩니다. medium/large 모델 기준 CPU 대비 **5~15배 빠름** (RTX 4090 벤치마크: medium 모델 12.5배).
-- 패키지가 없으면 자동으로 CPU `int8`으로 폴백합니다. 수동 제어는 환경변수 `STT_USE_CUDA=1`(강제 켬) / `0`(강제 끔)로 가능합니다.
+- 첫 사용 시 STT 체크박스를 켜고 추출을 시작하면, 선택한 모델(`tiny`/`base`/`small`/`medium`/`large-v3`)을 Hugging Face([ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp))에서 자동으로 내려받아 `%LOCALAPPDATA%\YouTubeTranscriptExtractor\stt-models`에 캐싱합니다. 이후 오프라인 동작.
+- **GPU 자동 사용**: Vulkan을 초기화할 수 있으면 GPU로, 아니면 CPU로 — 별도 설정이 없습니다. 수동 제어는 환경변수 `STT_USE_GPU=0`(GPU 강제 끔)으로 가능합니다.
 
-> **속도 가이드 (213초 오디오 기준)**:
-> | 모델 | CPU int8 | GPU float16 (4090) |
-> |------|---------|--------------------|
-> | small | 32초 (6.5x) | 5초 (43x) |
-> | medium | 63초 (3.4x) | 5초 (43x) |
+> **속도 가이드 (282초 오디오, small 모델, 실측)**:
+> | 백엔드 | 변환 시간 | 배속 |
+> |--------|----------|------|
+> | GPU Vulkan (RTX 4090) | 2.0초 | 141x 실시간 |
+> | CPU AVX2 | 20.5초 | 13.8x 실시간 |
 >
-> 1시간 영상 = small+CPU 약 9분 / medium+GPU 약 1.4분. GPU가 있다면 medium 추천.
+> 1시간 영상 = small+CPU 약 4분 / small+GPU 약 30초. GPU가 있다면 medium도 부담 없습니다.
 
-> **VAD 필터**: STT에서 **끄고** 동작합니다. faster-whisper의 Silero VAD는 노래/음악을 speech로 인식하지 못해 음악 영상에서 빈 결과가 나오기 때문입니다. Whisper 자체가 무음 구간을 attention으로 처리하므로 VAD 없이도 품질에 문제가 없습니다.
-- **VAD 필터**: 무음 구간을 자동 제거해 라이브 데드타임·인트로 잡음에 강합니다.
-- **성능 가이드**: 1시간 라이브 기준, `small` 모델 CPU 약 5~10분 / GPU 1~2분. 정확도가 더 필요하면 `medium`으로 올리세요.
+> **VAD 필터**: 사용하지 않습니다. (구 faster-whisper 시절 Silero VAD가 노래/음악을 speech로 인식하지 못해 음악 영상에서 빈 결과가 나왔던 문제로 제거.) Whisper 자체가 무음 구간을 attention으로 처리하므로 VAD 없이도 품질에 문제가 없습니다.
 
 ## 설치 및 실행
 
@@ -92,7 +86,7 @@ run_dev.bat                 :: 더블클릭 또는 터미널에서 실행 → GU
 run_dev.bat --selftest      :: 빌드 검증만 수행 (GUI 미실행)
 ```
 
-> `run_dev.bat`은 llama-cpp-python / faster-whisper 설치 실패를 자동으로 건너뛰고 해당 기능만 비활성화합니다. 핵심 자막/MP3/MP4 추출은 항상 동작합니다.
+> `run_dev.bat`은 llama-cpp-python / pywhispercpp 설치 실패를 자동으로 건너뛰고 해당 기능만 비활성화합니다. 핵심 자막/MP3/MP4 추출은 항상 동작합니다.
 
 **수동 설치**:
 
@@ -137,7 +131,7 @@ python scripts/deploy.py --dry-run  # 업로드 없이 목록 확인
 3. **포맷 카드**에서 문장 단위 / 단락 단위 / 타임스탬프 중 하나를 선택합니다.
 4. **추출 항목**에서 `자막 (.md)` / `MP3 음원` / `MP4 영상`을 선택합니다(여러 개 동시 가능). `MP4 영상` 선택 시 화질(1080p / 720p / 원본)을 고를 수 있습니다.
 5. **한국어 번역도 함께 저장** 체크 시, AI 번역 완료 후 `.ko.md` 파일이 자동 저장됩니다.
-6. (선택) **🎙 자막 없으면 STT로 자동 생성** 체크 시, 자막이 없는 영상/라이브 영상을 폴링 대기 + faster-whisper STT로 처리합니다. **자막 대기**(분)와 **라이브 캡처**(분), **STT 모델**을 함께 설정합니다.
+6. (선택) **🎙 자막 없으면 STT로 자동 생성** 체크 시, 자막이 없는 영상/라이브 영상을 폴링 대기 + 내장 Whisper STT로 처리합니다. **자막 대기**(분)와 **라이브 캡처**(분), **STT 모델**을 함께 설정합니다.
 7. **추출 시작**을 누르면 병렬 처리가 시작됩니다.
 8. 표의 항목을 더블클릭하면 저장된 파일이 열립니다.
 9. 추출 완료 후 우측 패널에서 **AI로 요약** 또는 **AI로 번역**을 눌러 AI 기능을 사용합니다.
@@ -182,14 +176,14 @@ YOUTUBE-SCRIPT-EXTRACTOR/
     ├── core.py                   # 추출 로직 (URL 파싱·자막·MP3·MP4·마크다운·폴백)
     ├── chat_render.py            # AI 채팅 HTML 렌더러
     ├── local_llm.py              # 내장 llama-cpp-python LLM 래퍼
-    ├── stt.py                    # (선택) faster-whisper STT 래퍼 — 자막 없는/라이브 영상
+    ├── stt.py                    # (선택) whisper.cpp(pywhispercpp) STT 래퍼 — 자막 없는/라이브 영상
     ├── splash.py                 # 스플래시 화면
     ├── updater.py                # 업데이트 확인 (백그라운드 QThread)
     └── img/
         └── mazelinebanner.jpg
 ```
 
-`core.py`는 GUI에 의존하지 않으므로 CLI 등 다른 프론트엔드에서도 재사용할 수 있습니다. `stt.py`는 faster-whisper가 설치된 경우에만 로드되며, 없으면 STT 옵션이 자동으로 비활성화됩니다.
+`core.py`는 GUI에 의존하지 않으므로 CLI 등 다른 프론트엔드에서도 재사용할 수 있습니다. `stt.py`는 pywhispercpp가 설치된 경우에만 로드되며, 없으면 STT 옵션이 자동으로 비활성화됩니다.
 
 ## 구현 가이드 (개발자용)
 

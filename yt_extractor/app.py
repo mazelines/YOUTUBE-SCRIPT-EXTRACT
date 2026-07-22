@@ -976,7 +976,7 @@ class MainWindow(QMainWindow):
         self._running = False
         # Set on close to tell in-flight workers to abort promptly.
         self._shutdown = threading.Event()
-        # Whether faster-whisper imports (probed in a worker thread to avoid
+        # Whether pywhispercpp imports (probed in a worker thread to avoid
         # blocking startup; defaults to False until the probe finishes).
         self._stt_available = False
 
@@ -1103,11 +1103,12 @@ class MainWindow(QMainWindow):
         opt.addWidget(self.translate_cb, 4, 0, 1, 6)
 
         # --- STT fallback (자막이 없는 영상 / 라이브 영상 처리) ---
-        self.stt_cb = QCheckBox("🎙 자막 없으면 STT로 자동 생성 (faster-whisper)")
+        self.stt_cb = QCheckBox("🎙 자막 없으면 STT로 자동 생성 (Whisper)")
         self.stt_cb.setToolTip(
-            "YouTube 자막이 없을 때 음성을 내려받아 faster-whisper로 텍스트를 "
-            "생성합니다. 라이브 영상도 지정한 시간만큼 캡처해 변환합니다. "
-            "faster-whisper 설치 필요: pip install -r requirements-stt.txt"
+            "YouTube 자막이 없을 때 음성을 내려받아 내장 Whisper(whisper.cpp)로 "
+            "텍스트를 생성합니다. 라이브 영상도 지정한 시간만큼 캡처해 변환합니다. "
+            "GPU(Vulkan)가 있으면 자동으로 가속됩니다. "
+            "소스 실행 시 pywhispercpp 설치 필요: requirements-stt.txt 참고"
         )
         opt.addWidget(self.stt_cb, 5, 0, 1, 2)
 
@@ -1266,12 +1267,13 @@ class MainWindow(QMainWindow):
         self.stt_model_combo.setEnabled(stt_active)
 
     def _probe_stt_async(self):
-        """Detect faster-whisper off the UI thread so import cost never blocks.
+        """Detect pywhispercpp off the UI thread so import cost never blocks.
 
-        Importing faster-whisper pulls in CTranslate2 (~1s cold). We run it on
-        a worker thread and flip ``_stt_available`` + re-sync controls on the
-        GUI thread when done. If unavailable, the STT checkbox stays disabled
-        with its tooltip explaining how to install it.
+        Importing pywhispercpp loads the whisper.cpp native extension (can be
+        slow on a cold HDD). We run it on a worker thread and flip
+        ``_stt_available`` + re-sync controls on the GUI thread when done. If
+        unavailable, the STT checkbox stays disabled with its tooltip
+        explaining how to install it.
 
         The signal QObject is kept alive on ``self`` (not just on the worker)
         because Qt deletes C++ signal sources when their Python wrapper is
@@ -1295,7 +1297,12 @@ class MainWindow(QMainWindow):
                     avail = is_stt_available()
                 except Exception:
                     avail = False
-                inner.sig.done.emit(avail)
+                try:
+                    inner.sig.done.emit(avail)
+                except RuntimeError:
+                    # Window closed while we probed — the signal's C++ side
+                    # is already deleted. Nothing to deliver to; drop it.
+                    pass
 
         # Keep a strong reference on self for the worker's lifetime.
         self._stt_probe_sig = _ProbeSignal()
@@ -1305,7 +1312,7 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_stt_probe(self, available: bool):
         # The probe runs on a background thread; the user may close the window
-        # while it's still importing faster-whisper (slow on a cold HDD). By
+        # while it's still importing pywhispercpp (slow on a cold HDD). By
         # the time the queued `done` signal is delivered, either this MainWindow
         # or one of the widgets below can already be torn down — accessing them
         # raises RuntimeError ("wrapped C/C++ object of type X has been
@@ -1316,8 +1323,8 @@ class MainWindow(QMainWindow):
             if not self._stt_available:
                 self.stt_cb.setChecked(False)
                 self.stt_cb.setToolTip(
-                    "faster-whisper가 설치되어 있지 않아 STT 폴백을 사용할 수 없습니다.\n"
-                    "설치: pip install -r requirements-stt.txt"
+                    "STT 구성요소(pywhispercpp)가 설치되어 있지 않아 STT 폴백을 "
+                    "사용할 수 없습니다.\n설치: requirements-stt.txt의 안내 참고"
                 )
             self._sync_output_controls()
         except RuntimeError:
@@ -1510,7 +1517,7 @@ class MainWindow(QMainWindow):
         want_transcript = self.transcript_cb.isChecked()
         stt_fallback = want_transcript and self.stt_cb.isChecked() and self.stt_cb.isEnabled()
         # Map the human-readable combo entry back to a model size token
-        # faster-whisper understands ("small (권장)" -> "small").
+        # Whisper understands ("small (권장)" -> "small").
         stt_label = self.stt_model_combo.currentText().split(" ")[0]
         if stt_label not in ("tiny", "base", "small", "medium", "large-v3"):
             stt_label = "small"
@@ -1640,7 +1647,7 @@ class MainWindow(QMainWindow):
         self._shutdown.set()
         self.pool.clear()
         # Disconnect the STT probe signal proactively: a probe worker may still
-        # be importing faster-whisper when the window closes, and its queued
+        # be importing pywhispercpp when the window closes, and its queued
         # `done` emit would otherwise land on a torn-down MainWindow. Even
         # though _on_stt_probe guards with try/except, dropping the connection
         # here means the emit becomes a no-op instead of relying on the slot
@@ -1702,12 +1709,16 @@ def _run_selftest() -> int:
     # STT fallback engine is likewise optional. Report presence/absence for
     # build verification, but never fail the selftest over it.
     try:
-        import faster_whisper  # noqa: F401
-        stt_status = (
-            f"faster_whisper {getattr(faster_whisper, '__version__', '?')}"
-        )
+        import pywhispercpp  # noqa: F401
+        # The package doesn't export __version__; ask pip metadata instead.
+        from importlib.metadata import version as _pkg_version
+        try:
+            _pw_ver = _pkg_version("pywhispercpp")
+        except Exception:
+            _pw_ver = "?"
+        stt_status = f"pywhispercpp {_pw_ver}"
     except Exception as e:
-        stt_status = f"faster_whisper absent ({e.__class__.__name__})"
+        stt_status = f"pywhispercpp absent ({e.__class__.__name__})"
 
     # Instantiate the GUI offscreen to confirm widgets/resources load.
     try:

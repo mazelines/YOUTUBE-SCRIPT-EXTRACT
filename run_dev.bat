@@ -10,7 +10,7 @@ REM  - Core (자막/MP3/MP4):        requirements.txt          -> always
 REM  - AI chat (내장 모델):         requirements-ai.txt       -> attempted
 REM        llama-cpp-python may need an AVX2 source build; see that file.
 REM        A wheel-install failure here is non-fatal — AI chat just stays off.
-REM  - STT fallback (faster-whisper): requirements-stt.txt    -> attempted
+REM  - STT fallback (pywhispercpp): requirements-stt.txt      -> attempted
 REM        Also non-fatal; STT options auto-disable if the import fails.
 REM
 REM  Re-run safely: pip skips already-installed packages, so the second launch
@@ -123,13 +123,13 @@ if errorlevel 1 (
     echo [OK]  llama-cpp-python 설치 완료 (AI 채팅 사용 가능^)
 )
 
-REM --- Optional: STT (faster-whisper) --------------------------------------
+REM --- Optional: STT (pywhispercpp / whisper.cpp) ---------------------------
 "%VENV_PY%" -m pip install -r requirements-stt.txt
 if errorlevel 1 (
-    echo [WARN] faster-whisper 설치 실패 - STT 폴백은 비활성화됩니다.
-    echo       requirements-stt.txt 참고.
+    echo [WARN] pywhispercpp 설치 실패 - STT 폴백은 비활성화됩니다.
+    echo       requirements-stt.txt 참고. ^(GPU 가속은 Vulkan 소스 빌드 필요^)
 ) else (
-    echo [OK]  faster-whisper 설치 완료 (STT 폴백 사용 가능^)
+    echo [OK]  pywhispercpp 설치 완료 (STT 폴백 사용 가능^)
 )
 
 REM --- Launch --------------------------------------------------------------

@@ -1,9 +1,15 @@
-"""Built-in STT (speech-to-text) via faster-whisper.
+"""Built-in STT (speech-to-text) via whisper.cpp (pywhispercpp).
 
-Mirrors ``local_llm.py``: faster-whisper is an *optional* dependency. The heavy
+Mirrors ``local_llm.py``: pywhispercpp is an *optional* dependency. The heavy
 import is deferred until first use so the app launches fine even where it isn't
 installed. Models download from Hugging Face on first use and cache under the
 user's app-data dir, the same way the GGUF model does.
+
+Why whisper.cpp instead of faster-whisper: it shares the ggml backend with the
+built-in LLM (llama.cpp), so a single Vulkan build accelerates STT on ANY GPU
+vendor (NVIDIA/AMD/Intel) — no CUDA-only path, no ~600MB of cuBLAS/cuDNN
+wheels. Machines without a usable GPU fall back to the AVX2 CPU backend
+automatically inside whisper.cpp.
 
 The output shape ``(text, start, duration)`` matches ``TranscriptResult.snippets``
 so the rest of the pipeline (sentence/paragraph merge, markdown) works
@@ -13,7 +19,7 @@ unchanged for both real YouTube captions and STT-generated ones.
 from __future__ import annotations
 
 import os
-import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -26,22 +32,29 @@ class STTError(Exception):
 
 # Whisper model sizes we allow the user to pick. The default ``small`` is a
 # good speed/accuracy tradeoff across languages including Korean; ``medium`` /
-# ``large-v3`` improve accuracy at a steep CPU cost. Sizes map to the official
-# OpenAI checkpoint names that SYSTRAN/faster-whisper converts on download.
+# ``large-v3`` improve accuracy at a higher inference cost. Sizes map to the
+# GGML conversions that ggerganov/whisper.cpp publishes on Hugging Face.
 STT_MODEL_SIZES = ("tiny", "base", "small", "medium", "large-v3")
 DEFAULT_STT_MODEL = "small"
 
-# Cached WhisperModel instances keyed by size — loading is expensive.
+# ggerganov's official GGML conversions of the OpenAI checkpoints. Single-file
+# models (no tokenizer/config sidecars), so a plain streamed download is the
+# whole story — no huggingface_hub needed.
+_MODEL_URL_TMPL = (
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{size}.bin"
+)
+
+# Cached pywhispercpp Model instances keyed by size — loading is expensive.
 _models: dict[str, object] = {}
 # Guards the _models dict so concurrent QThreadPool workers don't each kick
-# off a multi-GB WhisperModel load for the same size before any of them
-# finishes. With GUI default concurrency=4, four caption-less URLs submitted
-# together would otherwise load the model four times.
+# off a multi-GB model load for the same size before any of them finishes.
+# With GUI default concurrency=4, four caption-less URLs submitted together
+# would otherwise load the model four times.
 _models_lock = threading.Lock()
-# Guards transcription calls: a single WhisperModel instance isn't guaranteed
-# thread-safe (CTranslate2 sessions share state), so we serialise transcribe
-# across workers. Inference is the slow step, so this effectively caps STT
-# throughput at 1 regardless of concurrency — but it's correct.
+# Guards transcription calls: a whisper.cpp context is not safe for concurrent
+# whisper_full() runs, so we serialise transcribe across workers. Inference is
+# the slow step, so this effectively caps STT throughput at 1 regardless of
+# concurrency — but it's correct.
 _transcribe_lock = threading.Lock()
 
 
@@ -63,136 +76,52 @@ def _data_dir() -> Path:
 
 
 def model_path(size: str = DEFAULT_STT_MODEL) -> Path:
-    """Local directory where a Whisper model of ``size`` is materialised.
-
-    faster-whisper normally pulls from the HF cache, but we symlink/copy a
-    named directory here too so ``is_model_present`` can give a definitive
-    "ready" answer and users can wipe one folder to reset.
-    """
-    return _data_dir() / size
+    """Local file where the GGML Whisper model of ``size`` is stored."""
+    return _data_dir() / f"ggml-{size}.bin"
 
 
-def _hf_repo_for(size: str) -> tuple[str, str]:
-    """Return (repo_id, filename) for ``size`` on Hugging Face.
-
-    We use SYSTRAN's converted-CTranslate2 mirrors, which faster-whisper loads
-    directly without an on-the-fly conversion step.
-    """
-    if size == "large-v3":
-        return ("Systran/faster-whisper-large-v3", "model.bin")
-    return (f"Systran/faster-whisper-{size}", "model.bin")
+def _model_url(size: str) -> str:
+    return _MODEL_URL_TMPL.format(size=size)
 
 
 def is_stt_available() -> bool:
-    """True if faster-whisper imports (i.e. the optional dep is installed).
+    """True if pywhispercpp imports (i.e. the optional dep is installed).
 
     This is checked at runtime to decide whether to enable STT UI; it never
     raises — the import is wrapped so a broken install doesn't crash startup.
+    Importing ``pywhispercpp.model`` loads the compiled extension, so a build
+    that can't load (missing runtime DLLs) correctly reports unavailable.
     """
     try:
-        import faster_whisper  # noqa: F401
+        from pywhispercpp.model import Model  # noqa: F401
         return True
     except Exception:
         return False
 
 
 def is_model_present(size: str = DEFAULT_STT_MODEL) -> bool:
-    """True when the model directory contains the expected weight file.
-
-    faster-whisper also keeps a copy in the HF cache (``~/.cache/huggingface``)
-    that's reused across runs, so a model only counts as "absent" if *neither*
-    location has it. The HF cache is the authoritative source — our own
-    ``model_path`` is just a marker so the UI can show a clear download state.
-    """
-    if (model_path(size) / "model.bin").exists():
-        return True
-    # Fall back to the HF hub cache: faster-whisper uses the standard cache.
+    """True when the single-file GGML model exists and is non-empty."""
+    p = model_path(size)
     try:
-        from huggingface_hub import hf_hub_url, try_to_load_from_cache  # noqa
-        repo, fname = _hf_repo_for(size)
-        cached = try_to_load_from_cache(repo, fname)
-        if cached is not None and Path(cached).exists():
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _purge_model_dir(dest: Path) -> None:
-    """Remove a (possibly partial) model directory so the next download starts
-    clean. Best-effort: any failure is swallowed because this runs from error
-    paths where raising would mask the original problem.
-    """
-    try:
-        if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-    except Exception:
-        pass
+        return p.exists() and p.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def download_model(size: str = DEFAULT_STT_MODEL,
                    on_progress=None, should_cancel=None) -> None:
-    """Download a Whisper checkpoint via huggingface_hub if available.
+    """Stream the GGML Whisper model from Hugging Face, atomically.
 
-    We prefer ``huggingface_hub.snapshot_download`` (the same path
-    faster-whisper uses internally) so the result lands in the HF cache that
-    ``_get_model`` reads from. If huggingface_hub isn't installed, we fall back
-    to a plain ``requests`` stream of ``model.bin`` into our own dir — slower
-    (no tokenizer files) but enough for a self-contained STT.
+    Writes to a ``.part`` file and renames on success, so a cancelled or
+    failed download never leaves a truncated file that later looks valid
+    (same pattern as ``local_llm.download_model``).
 
     ``on_progress(done_bytes, total_bytes)`` is called as data arrives.
-    Raises STTError on any failure; a cancelled/aborted download leaves no
-    partial state that later looks valid.
+    Raises STTError on any failure.
     """
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        snapshot_download = None
-
-    repo, _ = _hf_repo_for(size)
-    if snapshot_download is not None:
-        # Clean up any partial download from a previous failed attempt before
-        # re-running — huggingface_hub can leave config.json etc. behind on a
-        # network timeout, then on the *next* call report "already downloaded"
-        # and let our marker touch succeed even though model.bin is missing.
-        # _purge_model_dir is best-effort and never raises.
-        dest = model_path(size)
-        try:
-            # Note: ``local_dir_use_symlinks`` was removed in huggingface_hub
-            # >= 1.0 (it's the default behaviour when ``local_dir`` is set),
-            # so we don't pass it — older versions also accept its absence and
-            # default to copying.
-            snapshot_download(repo, local_dir=str(dest))
-        except Exception as e:
-            # snapshot_download may have written a partial tree; remove it so
-            # the next attempt starts clean instead of resuming into a broken
-            # state.
-            _purge_model_dir(dest)
-            raise STTError(f"STT 모델 다운로드 실패: {e}")
-        # Verify the real model weight actually landed before trusting the
-        # directory. snapshot_download can return without raising even when
-        # only some files were fetched (resume-from-cache quirks), in which
-        # case touching a marker would later make is_model_present lie and
-        # _get_model would segfault on the missing model.bin.
-        bin_path = dest / "model.bin"
-        if not bin_path.exists() or bin_path.stat().st_size == 0:
-            _purge_model_dir(dest)
-            raise STTError(
-                f"STT 모델 다운로드가 불완전합니다 (model.bin 누락). "
-                "네트워크 상태를 확인하고 다시 시도하세요."
-            )
-        # Marker so is_model_present is fast next time even if HF cache
-        # gets cleared. Only created after the integrity check above passed.
-        bin_path.touch(exist_ok=True)
-        return
-
-    # Fallback: stream model.bin only. Good enough for a self-contained run,
-    # though faster-whisper may re-fetch tokenizer config on first load.
     dest = model_path(size)
-    dest.mkdir(parents=True, exist_ok=True)
-    bin_path = dest / "model.bin"
-    tmp = bin_path.with_suffix(".bin.part")
-    url = f"https://huggingface.co/{repo}/resolve/main/model.bin"
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    url = _model_url(size)
     headers = {"User-Agent": "YouTubeTranscriptExtractor"}
     try:
         with requests.get(url, stream=True, timeout=60, headers=headers) as resp:
@@ -204,7 +133,7 @@ def download_model(size: str = DEFAULT_STT_MODEL,
             total = int(resp.headers.get("Content-Length", 0))
             done = 0
             with open(tmp, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1 << 20):
+                for chunk in resp.iter_content(chunk_size=1 << 20):  # 1 MiB
                     if should_cancel and should_cancel():
                         raise STTError("다운로드가 취소되었습니다.")
                     if not chunk:
@@ -213,9 +142,12 @@ def download_model(size: str = DEFAULT_STT_MODEL,
                     done += len(chunk)
                     if on_progress:
                         on_progress(done, total)
+            # Guard against a silently truncated download: a short file would
+            # still rename to the real path and then fail cryptically at load.
             if total > 0 and done != total:
                 raise STTError(
-                    f"다운로드가 불완전합니다 ({done:,}/{total:,} bytes)."
+                    f"다운로드가 불완전합니다 ({done:,}/{total:,} bytes). "
+                    "다시 시도하세요."
                 )
     except requests.RequestException as e:
         tmp.unlink(missing_ok=True)
@@ -223,95 +155,51 @@ def download_model(size: str = DEFAULT_STT_MODEL,
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    os.replace(tmp, bin_path)
+    os.replace(tmp, dest)
 
 
-def _resolve_model_arg(size: str) -> str:
-    """Decide what to pass to WhisperModel — a local dir if we have it, else
-    the bare size name so faster-whisper downloads to its HF cache itself."""
-    local = model_path(size)
-    if (local / "model.bin").exists() and (local / "config.json").exists():
-        return str(local)
-    return size
+def _load_audio(audio_path: str | Path):
+    """Decode any audio/video file to the mono 16 kHz float32 PCM whisper
+    expects, using the ffmpeg binary already shipped via imageio-ffmpeg.
 
-
-# Cached result of the CUDA-DLL probe so we only scan site-packages once.
-_cuda_dlls_ok: bool | None = None
-
-
-def _ensure_cuda_dlls() -> bool:
-    """Locate NVIDIA CUDA DLLs (cublas/cudnn/nvrtc) installed via pip wheels
-    and expose them to ctranslate2. Returns True if the required DLLs look
-    present, False if CUDA can't be made to work (caller falls back to CPU).
-
-    ctranslate2 loads ``cublas64_12.dll`` etc. via LoadLibrary, which on
-    Windows searches PATH + os.add_dll_directory() targets — it does NOT
-    search inside ``site-packages/nvidia/...`` automatically. The
-    ``nvidia-cublas-cu12`` (and cudnn/nvrtc) pip packages drop the DLLs
-    exactly there, so we have to register those bin dirs ourselves.
-
-    Idempotent: the result is memoised in ``_cuda_dlls_ok`` so the directory
-    scan happens only once per process.
+    We decode ourselves instead of handing pywhispercpp a file path so the
+    supported-formats story is identical to the rest of the app (whatever
+    ffmpeg can read), rather than depending on whisper.cpp's built-in decoders.
+    Returns a numpy float32 array. Raises STTError when decoding fails.
     """
-    global _cuda_dlls_ok
-    if _cuda_dlls_ok is not None:
-        return _cuda_dlls_ok
+    import numpy as np
+    from imageio_ffmpeg import get_ffmpeg_exe
 
+    cmd = [
+        get_ffmpeg_exe(), "-v", "error",
+        "-i", str(audio_path),
+        "-f", "f32le", "-ac", "1", "-ar", "16000",
+        "-",
+    ]
+    run_kwargs = {}
+    if os.name == "nt":
+        run_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
     try:
-        import importlib.util
-
-        # Find site-packages by looking up any pip-installed dist.
-        # importlib.util.find_spec on a stdlib module gives its origin; we
-        # actually want the *site-packages* dir, which we get from the
-        # nvidia namespace package if it exists.
-        import importlib
-        spec = importlib.util.find_spec("faster_whisper")
-        if spec is None or not spec.submodule_search_locations:
-            _cuda_dlls_ok = False
-            return False
-        site_packages = list(spec.submodule_search_locations)[0]
-        nvidia_root = Path(site_packages).parent / "nvidia"
-
-        added = 0
-        for sub in ("cublas", "cudnn", "cuda_nvrtc"):
-            bin_dir = nvidia_root / sub / "bin"
-            if not bin_dir.is_dir():
-                continue
-            # os.add_dll_directory is the modern (3.8+) way and is required
-            # because PATH-only discovery is unreliable for subprocess-launched
-            # Python. We also prepend to PATH as belt-and-suspenders.
-            try:
-                os.add_dll_directory(str(bin_dir.resolve()))
-            except (OSError, FileNotFoundError):
-                pass
-            os.environ["PATH"] = (
-                str(bin_dir.resolve()) + os.pathsep + os.environ.get("PATH", "")
-            )
-            added += 1
-        # Need all three (cublas + cudnn + nvrtc) to trust cuda float16.
-        _cuda_dlls_ok = added >= 3
-    except Exception:
-        _cuda_dlls_ok = False
-    return _cuda_dlls_ok
-
+        proc = subprocess.run(cmd, capture_output=True, **run_kwargs)
+    except OSError as e:
+        raise STTError(f"오디오 디코딩(ffmpeg) 실행 실패: {e}")
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace")[-300:]
+        raise STTError(f"오디오 디코딩 실패: {tail}")
+    audio = np.frombuffer(proc.stdout, dtype=np.float32)
+    if audio.size == 0:
+        raise STTError("오디오 디코딩 결과가 비어 있습니다 (무음/손상 파일).")
+    return audio
 
 
 def _get_model(size: str = DEFAULT_STT_MODEL):
-    """Load (once per size) and return a faster-whisper WhisperModel.
+    """Load (once per size) and return a pywhispercpp Model.
 
-    Device selection:
-    * If ``STT_USE_CUDA`` env var is set (1/true/yes): force CUDA float16.
-    * If ``STT_USE_CUDA=0`` (or "false"/"no"): force CPU int8.
-    * Otherwise: auto-detect. Use CUDA when the cublas/cudnn/nvrtc DLLs are
-      installed (via the nvidia-*-cu12 pip wheels) — that's a 5-15x speedup
-      for medium+ models on a discrete GPU. Fall back to CPU int8 otherwise.
-
-    The naive "try cuda, catch at construction" pattern is unsafe for
-    faster-whisper: ``WhisperModel(device="cuda")`` succeeds at construction
-    (lazy CUDA context) and only fails inside ``transcribe()`` with a DLL
-    load error like "cublas64_12.dll is not found" — past our fallback point.
-    So we probe the DLLs explicitly with ``_ensure_cuda_dlls`` before
-    attempting cuda, rather than catching the construction error.
+    GPU selection:
+    * ``STT_USE_GPU=0`` (or "false"/"no"): force the CPU backend.
+    * Otherwise the GPU is used whenever the Vulkan backend can initialise —
+      whisper.cpp itself falls back to CPU when no usable GPU/driver exists,
+      so one build covers every machine (same story as the built-in LLM).
     """
     # Fast path: already loaded. Checked outside the lock so the common case
     # (model resident, several workers transcribing) doesn't serialise here.
@@ -323,47 +211,45 @@ def _get_model(size: str = DEFAULT_STT_MODEL):
         if size in _models:
             return _models[size]
         try:
-            from faster_whisper import WhisperModel
+            from pywhispercpp.model import Model
         except ImportError:
             raise STTError(
-                "STT 기능에 필요한 faster-whisper가 설치되어 있지 않습니다.\n"
-                "requirements-stt.txt의 안내대로 설치하세요 "
-                "(pip install -r requirements-stt.txt)."
+                "STT 기능에 필요한 pywhispercpp가 설치되어 있지 않습니다.\n"
+                "requirements-stt.txt의 안내대로 설치하세요."
             )
         if not is_model_present(size):
             raise STTError(f"STT 모델({size})이 없습니다. 먼저 다운로드가 필요합니다.")
 
-        model_arg = _resolve_model_arg(size)
+        gpu_pref = os.environ.get("STT_USE_GPU", "").lower()
+        use_gpu = gpu_pref not in ("0", "false", "no")
         threads = max(1, (os.cpu_count() or 4) - 1)
 
-        # Decide cuda vs cpu BEFORE constructing WhisperModel — see docstring.
-        cuda_pref = os.environ.get("STT_USE_CUDA", "").lower()
-        if cuda_pref in ("0", "false", "no"):
-            want_cuda = False
-        elif cuda_pref in ("1", "true", "yes"):
-            want_cuda = True
-        else:
-            want_cuda = _ensure_cuda_dlls()
-
-        if want_cuda:
-            try:
-                m = WhisperModel(model_arg, device="cuda", compute_type="float16")
-                _models[size] = m
-                return m
-            except Exception as e:
-                # DLL probe said cuda should work but model load still failed
-                # (e.g. out-of-VRAM, driver/runtime mismatch). Surface once
-                # and fall through to CPU so STT still completes.
-                import warnings
-                warnings.warn(
-                    f"CUDA 로딩 실패, CPU로 전환: {e}"
-                )
         try:
-            m = WhisperModel(
-                model_arg, device="cpu", compute_type="int8", cpu_threads=threads,
+            m = Model(
+                str(model_path(size)),
+                # Silence whisper.cpp's C-level log spam — the GUI app has no
+                # console, and load/inference logs would just be lost noise.
+                redirect_whispercpp_logs_to=None,
+                n_threads=threads,
+                context_params={"use_gpu": use_gpu},
             )
+        except STTError:
+            raise
         except Exception as e:
-            raise STTError(f"STT 모델 로딩 실패: {e}")
+            if use_gpu:
+                # GPU init can fail outright on broken Vulkan drivers. Retry
+                # once on CPU so STT still completes instead of dying.
+                try:
+                    m = Model(
+                        str(model_path(size)),
+                        redirect_whispercpp_logs_to=None,
+                        n_threads=threads,
+                        context_params={"use_gpu": False},
+                    )
+                except Exception as e2:
+                    raise STTError(f"STT 모델 로딩 실패: {e2}")
+            else:
+                raise STTError(f"STT 모델 로딩 실패: {e}")
         _models[size] = m
         return m
 
@@ -381,56 +267,65 @@ def transcribe_audio(audio_path: str | Path,
     ``language`` (e.g. ``"en"``, ``"ko"``) skips the auto-detect step — pass
     ``None`` to let Whisper detect. ``on_progress(seg_idx)`` is called per
     emitted segment so the GUI can show "segment N" progress. Cancellation is
-    honoured between segments.
+    checked inside whisper.cpp's abort callback, so a cancel takes effect
+    mid-transcription (between ggml graph runs), not only at the end.
     """
-    try:
-        model = _get_model(model_size)
-    except STTError:
-        raise
+    model = _get_model(model_size)
+    audio = _load_audio(audio_path)
 
-    # Serialise transcription across workers. faster-whisper's WhisperModel is
-    # not documented as thread-safe (CTranslate2 sessions share internal state),
-    # so concurrent transcribe() calls on one cached model could race. This
-    # caps effective STT parallelism at 1, which is fine — inference is the
-    # bottleneck, not I/O, and model load is already serialised by _models_lock.
+    # Serialise transcription across workers — a whisper.cpp context doesn't
+    # support concurrent whisper_full() calls. This caps effective STT
+    # parallelism at 1, which is fine: inference is the bottleneck, not I/O,
+    # and model load is already serialised by _models_lock.
     with _transcribe_lock:
+        seg_counter = {"n": 0}
+
+        def _on_new_segment(_seg):
+            # Progress only — never let a GUI-side error kill transcription.
+            seg_counter["n"] += 1
+            if on_progress:
+                try:
+                    on_progress(seg_counter["n"])
+                except Exception:
+                    pass
+
+        def _abort() -> bool:
+            try:
+                return bool(should_cancel and should_cancel())
+            except Exception:
+                return False
+
         try:
-            segments, info = model.transcribe(
-                str(audio_path),
-                language=language,
-                task="transcribe",
-                beam_size=5,
-                # VAD is OFF. faster-whisper ships Silero VAD, which is trained
-                # on conversational speech — it classifies *singing* (music,
-                # songs, melodic speech) as non-speech and filters it out, so
-                # music videos / lyric videos / live concert streams produced
-                # zero segments with vad_filter=True. Whisper itself handles
-                # silence well via its own attention, so the VAD trade-off
-                # (skip silence vs. drop singing) isn't worth it for the
-                # general YouTube corpus this app targets.
-                vad_filter=False,
-                without_timestamps=False,
+            segments = model.transcribe(
+                audio,
+                # whisper.cpp treats "" as "run language detection first";
+                # an explicit code like "ko" skips it. ("auto" also works but
+                # triggers a harmless "unknown language" stderr warning.)
+                language=(language or ""),
+                translate=False,
+                # Progress goes through new_segment_callback → the GUI; the
+                # C-level "Progress: N%" stderr prints are just noise (and
+                # invisible in the windowed app anyway).
+                print_progress=False,
+                new_segment_callback=_on_new_segment,
+                abort_callback=_abort,
             )
         except Exception as e:
-            raise STTError(f"STT 변환 시작 실패: {e}")
+            raise STTError(f"STT 변환 실패: {e}")
 
-        # faster-whisper returns a *generator*; iteration does the actual work,
-        # so we walk it here and surface progress + cancellation per segment.
+        if should_cancel and should_cancel():
+            raise STTError("STT 변환이 취소되었습니다.")
+
+        # Segment times are in centiseconds (10 ms units — whisper.cpp's
+        # native resolution), so /100 yields seconds.
         snippets: list[tuple[str, float, float]] = []
-        try:
-            for i, seg in enumerate(segments):
-                if should_cancel and should_cancel():
-                    raise STTError("STT 변환이 취소되었습니다.")
-                text = (seg.text or "").strip()
-                if not text:
-                    continue
-                snippets.append((text, float(seg.start), float(seg.end - seg.start)))
-                if on_progress:
-                    on_progress(i + 1)
-        except STTError:
-            raise
-        except Exception as e:
-            raise STTError(f"STT 변환 중 오류: {e}")
+        for seg in segments:
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            start = float(seg.t0) / 100.0
+            duration = float(seg.t1 - seg.t0) / 100.0
+            snippets.append((text, start, duration))
 
     return snippets
 
@@ -444,11 +339,10 @@ def detect_language(audio_path: str | Path,
     """
     try:
         model = _get_model(model_size)
-        _, info = model.transcribe(
-            str(audio_path), language=None, task="transcribe",
-            beam_size=1, vad_filter=False, without_timestamps=True,
-        )
-        return getattr(info, "language", None)
+        audio = _load_audio(audio_path)
+        with _transcribe_lock:
+            (lang, _prob), _all = model.auto_detect_language(audio)
+        return lang or None
     except Exception:
         return None
 
