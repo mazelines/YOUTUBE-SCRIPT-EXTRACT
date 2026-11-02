@@ -1,14 +1,33 @@
 # YouTube 자막 추출기 (YouTube Transcript Extractor)
 
+[![Version 1.1.4](https://img.shields.io/badge/version-1.1.4-cde86a)](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.1.4)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![PySide6 / Qt 6](https://img.shields.io/badge/GUI-PySide6%20%2F%20Qt%206-41CD52)
+
 YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크다운(.md)**과 **원문 SRT(.srt)** 파일로 함께 저장하고, 선택적으로 **MP3 음원**과 **MP4 영상**도 내려받는 데스크톱 프로그램입니다. Qt 6(PySide6) 기반 GUI이며, **여러 영상을 동시에** 추출할 수 있습니다.
 
-![YouTube 자막 추출기 스크린샷](docs/screenshot.png)
+![YouTube 자막 추출기 1.1.4 실행 화면 — Markdown·SRT 추출, MP3·MP4 다운로드, AI 채팅](docs/screenshot.png)
+
+*버전 1.1.4를 Windows에서 실행한 화면입니다.*
+
+## 개발 언어 및 기술 구성
+
+| 구분 | 사용 기술 |
+|------|-----------|
+| 주요 개발 언어 | Python 3.10 이상 |
+| 데스크톱 UI | PySide6 / Qt 6 |
+| 자막·영상 처리 | youtube-transcript-api, yt-dlp, FFmpeg, Node.js / EJS |
+| 내장 AI·음성 인식 | llama-cpp-python, pywhispercpp |
+| 빌드·실행 스크립트 | PowerShell, Windows Batch, PyInstaller |
+
+프로젝트 라이선스는 **[MIT](LICENSE)**입니다. 포함된 라이브러리와 AI 모델에는 각 구성요소의 라이선스가 적용됩니다.
 
 ## 주요 기능
 
 - **다중 URL 입력** — 여러 줄로 붙여넣어 한 번에 목록에 추가
 - **동시 추출** — `QThreadPool` 기반 병렬 처리 (동시 작업 수 1~16 조절)
-- **자막 → 마크다운** — 제목·URL·채널·언어·추출 시각 메타데이터 + 본문
+- **자막 → Markdown + SRT** — 메타데이터를 포함한 Markdown과 원문 구간·시간을 보존한 SRT 동시 저장
 - **포맷 선택** — 문장 단위 / 단락 단위 / 타임스탬프 포함 3가지 형식
 - **MP3 음원 추출** — yt-dlp + 동봉 ffmpeg로 음원만 추출 (128 / 192 / 320 kbps)
 - **MP4 영상 다운로드** — 화질 선택(1080p / 720p / 원본), H.264 우선으로 어느 플레이어에서나 재생 (재인코딩 없이 mp4 컨테이너로 remux)
@@ -26,7 +45,7 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 - **번역 탭** — 자막 전체를 한국어로 번역, 완료 시 자동으로 `.ko.md` 파일로 저장 (체크박스 옵션)
 - **기본 제공자** — 앱 내장 모델(**Gemma 4 E4B**, Apache-2.0), 첫 사용 시 Hugging Face에서 자동 다운로드(약 5.3GB), 이후 오프라인 동작
 - **GPU 가속** — NVIDIA·AMD·Intel GPU 감지 시 Vulkan으로 자동 가속 (CPU 대비 ~10~20배), 없으면 CPU 동작
-- **외부 API 연결** — OpenAI / Ollama / 로컬 서버 주소 직접 입력 가능
+- **내장 모델 사용** — 현재 앱 UI는 별도 API 키 없이 내장 모델로 동작
 
 ### llama-cpp-python 설치 (내장 모델 사용 시)
 
@@ -45,7 +64,7 @@ pip install "llama-cpp-python>=0.3.0" --no-binary llama-cpp-python --no-cache-di
 YouTube가 아직 자막을 만들지 않은 **라이브 중인 영상**이나 **자막이 비활성화된 VOD**에서도 자막을 얻을 수 있습니다. 두 단계 폴백이 순차적으로 동작합니다.
 
 1. **자막 생성 대기(폴링)** — YouTube가 곧 자동 자막을 만들 경우를 대비해, 지정한 시간(기본 0분 — 끄짐) 동안 1분 간격으로 재시도합니다. 라이브가 곧 자막을 켤 것 같을 때만 값을 올립니다.
-2. **STT 자동 생성** — 폴링까지 실패하면 음성을 내려받아 [whisper.cpp](https://github.com/ggerganov/whisper.cpp)([pywhispercpp](https://github.com/absadiki/pywhispercpp) 바인딩)로 텍스트를 생성합니다. 결과는 `.stt.md` 접미사로 저장되어 YouTube 공식 자막과 구분됩니다.
+2. **STT 자동 생성** — 폴링까지 실패하면 음성을 내려받아 [whisper.cpp](https://github.com/ggerganov/whisper.cpp)([pywhispercpp](https://github.com/absadiki/pywhispercpp) 바인딩)로 텍스트를 생성합니다. 결과는 `.stt.md`와 `.stt.srt`로 저장되어 YouTube 공식 자막과 구분됩니다.
 
 | 상황 | 동작 |
 |------|------|
@@ -53,10 +72,10 @@ YouTube가 아직 자막을 만들지 않은 **라이브 중인 영상**이나 *
 | VOD + 자막 없음 + STT 켬 | 음성 전체 다운로드 → Whisper 변환 |
 | 라이브 + 자막 있음 | 기존처럼 자막 추출 |
 | 라이브 + 자막 없음 + 폴링만 | 자막 생성 시점까지 주기적 재시도 |
-| 라이브 + 자막 없음 + STT + 캡처시간 > 0 | 시작부터 N분 구간을 캡처해 STT로 변환 |
+| 라이브 + 자막 없음 + STT + 캡처시간 > 0 | 수신한 라이브 스트림을 지정한 시간만큼 캡처해 STT로 변환 |
 | 라이브 + 자막 없음 + STT + 캡처시간 = 0 | 안내 메시지 ("종료 후 재시도 또는 캡처 시간 지정") |
 
-> **주의**: 라이브 캡처는 yt-dlp의 `--live-from-start`를 사용하며, YouTube 정책에 따라 실패할 수 있습니다. 라이브 종료 후 처리하는 편이 가장 안정적입니다.
+> **라이브 캡처**: yt-dlp로 스트림 주소를 확인한 뒤 FFmpeg로 지정한 시간만큼 녹음합니다. 방송 시작부터의 전체 녹화를 보장하지 않으며, 스트림 상태나 접근 제한에 따라 실패할 수 있습니다.
 
 ### STT 구성요소 설치 (pywhispercpp, STT 폴백 사용 시)
 
@@ -262,10 +281,10 @@ def extract_webm(url, out_dir, **kwargs):
 ## 참고
 
 - 자막은 YouTube가 제공하는 경우에 가장 정확합니다. 자막이 없는 영상(비활성화·라이브 중)은 **STT 폴백** 옵션으로 처리할 수 있습니다 — [STT 폴백 / 라이브 영상 지원](#stt-폴백--라이브-영상-지원) 참고.
-- STT로 생성한 자막은 `.stt.md` 접미사로 저장되어 YouTube 공식 자막과 구분됩니다.
+- STT로 생성한 자막은 `.stt.md`와 `.stt.srt`로 저장되어 YouTube 공식 자막과 구분됩니다.
 - 짧은 시간에 많은 요청을 보내면 YouTube가 일시적으로 IP를 제한할 수 있습니다. 이 경우 동시 작업 수를 줄이세요.
 - 내장 AI 모델(Gemma 4 E4B)은 처음 실행 시 약 5.3GB를 다운로드합니다. 이후에는 오프라인으로 동작합니다.
 
 ---
 
-[MazeLine](https://mazeline.tech/) — 게임 개발의 새로운 기준
+[MazeLine](https://www.mazeline.tech) — 게임 개발의 새로운 기준
