@@ -20,12 +20,12 @@ from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl, QTimer,
     QStandardPaths,
 )
-from PySide6.QtGui import QDesktopServices, QBrush, QColor
+from PySide6.QtGui import QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPlainTextEdit, QPushButton, QLabel,
     QTableWidgetItem, QFileDialog, QProgressBar, QMessageBox, QFrame,
-    QTextBrowser, QTabWidget,
+    QTextBrowser, QTabWidget, QMenu,
 )
 
 from .core import (
@@ -48,6 +48,8 @@ from .local_llm import (
     is_loaded,
 )
 from .chat_render import render_conversation
+from .theme import repolish
+from .ui_layout import TONE_ROLE
 from .gpu_runtime import runtime_summary
 
 
@@ -63,14 +65,23 @@ ST_RUNNING = "진행 중"
 ST_DONE = "완료"
 ST_PARTIAL = "부분 완료"
 ST_ERROR = "실패"
+ST_CANCELLED = "취소됨"
 
-_STATUS_COLORS = {
-    ST_PENDING: "#64748b",
-    ST_RUNNING: "#3264da",
-    ST_DONE: "#16805d",
-    ST_PARTIAL: "#b07000",
-    ST_ERROR: "#c23e48",
+# Tone keys from theme.TONES; drive the status pill and row progress colour.
+_STATUS_TONES = {
+    ST_PENDING: "neutral",
+    ST_RUNNING: "info",
+    ST_DONE: "success",
+    ST_PARTIAL: "warning",
+    ST_ERROR: "danger",
+    ST_CANCELLED: "neutral",
 }
+# Rows the start button picks up; a stopped job can simply be started again.
+_STARTABLE = (ST_PENDING, ST_CANCELLED)
+_FINISHED = (ST_DONE, ST_PARTIAL, ST_ERROR)
+
+
+APP_TITLE = "YouTube 자막 추출기"
 
 
 def _force_kill_process_tree():
@@ -141,6 +152,10 @@ class ExtractWorker(QRunnable):
     def run(self):
         job_id = self.job_id
         if self._cancelled():
+            # Every launched job reports back once, so a stopped batch still
+            # reaches its completion count.
+            self.signals.status.emit(job_id, ST_CANCELLED)
+            self.signals.finished.emit(job_id, {"files": [], "errors": [], "cancelled": True})
             return
         self.signals.status.emit(job_id, ST_RUNNING)
         files, errors = [], []
@@ -211,13 +226,17 @@ class ExtractWorker(QRunnable):
             except Exception as e:
                 errors.append(("MP4", f"예기치 못한 오류: {e}"))
 
-        if errors and files:
+        cancelled = self._cancelled()
+        if cancelled and not files:
+            self.signals.status.emit(job_id, ST_CANCELLED)
+        elif (errors or cancelled) and files:
             self.signals.status.emit(job_id, ST_PARTIAL)
         elif errors:
             self.signals.status.emit(job_id, ST_ERROR)
         else:
             self.signals.status.emit(job_id, ST_DONE)
-        self.signals.finished.emit(job_id, {"files": files, "errors": errors})
+        self.signals.finished.emit(job_id, {"files": files, "errors": errors,
+                                            "cancelled": cancelled})
 
 
 class BuiltinSignals(QObject):
@@ -438,7 +457,7 @@ class BannerWidget(QFrame):
         lay.addWidget(brand)
         lay.addStretch()
         self.link = QPushButton("www.mazeline.tech ↗")
-        self.link.setFlat(True)
+        self.link.setObjectName("link")
         self.link.setCursor(Qt.PointingHandCursor)
         self.link.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.url)))
         lay.addWidget(self.link)
@@ -490,9 +509,11 @@ class ChatTab(QWidget):
         # flight. For chunked translation the bar is determinate (i/total);
         # for single-request work (summary, external LLM) it stays marquee.
         self._prog_label = QLabel("")
-        self._prog_label.setStyleSheet("color: #1769aa; font-size: 11px;")
+        self._prog_label.setObjectName("infoText")
         self._prog_bar = QProgressBar()
-        self._prog_bar.setTextVisible(True)
+        self._prog_bar.setObjectName("slimProgress")
+        # Chunk counts are spelled out in the status line above the bar.
+        self._prog_bar.setTextVisible(False)
         self._prog_box = QWidget()
         prog_lay = QVBoxLayout(self._prog_box)
         prog_lay.setContentsMargins(0, 0, 0, 4)
@@ -504,11 +525,9 @@ class ChatTab(QWidget):
 
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
-        # Force a light canvas regardless of system palette — chat bubbles are
-        # tuned for a light page.
-        self.view.setStyleSheet(
-            "QTextBrowser { background-color: #f8fafc; color: #24334b; }"
-        )
+        # Light canvas regardless of system palette — chat bubbles are tuned
+        # for a light page (see theme: QTextBrowser#chatView).
+        self.view.setObjectName("chatView")
         self.view.setPlaceholderText(placeholder)
         lay.addWidget(self.view, stretch=1)
 
@@ -517,27 +536,32 @@ class ChatTab(QWidget):
         self.quick_btn.clicked.connect(self.run_quick_prompt)
         quick.addWidget(self.quick_btn)
         quick.addStretch(1)
+        self.reset_btn = QPushButton("대화 초기화")
+        self.reset_btn.setObjectName("subtle")
+        self.reset_btn.clicked.connect(self.on_reset)
+        quick.addWidget(self.reset_btn)
         lay.addLayout(quick)
 
         self.input = QPlainTextEdit()
         self.input.setPlaceholderText("결과에 대한 추가 질문 입력 (Ctrl+Enter: 질문하기)")
+        self.input.setAccessibleName("AI에게 추가 질문")
         self.input.setMaximumHeight(80)
+        self.input.setTabChangesFocus(True)
         self.input.installEventFilter(self)
         lay.addWidget(self.input)
 
         send_row = QHBoxLayout()
-        self.send_btn = QPushButton("질문하기")
-        self.send_btn.setObjectName("primary")
-        self.send_btn.clicked.connect(self.on_send_clicked)
-        send_row.addWidget(self.send_btn)
+        send_row.addStretch(1)
         self.stop_btn = QPushButton("중지")
+        self.stop_btn.setObjectName("danger")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.on_stop)
         send_row.addWidget(self.stop_btn)
-        self.reset_btn = QPushButton("대화 초기화")
-        self.reset_btn.clicked.connect(self.on_reset)
-        send_row.addWidget(self.reset_btn)
-        send_row.addStretch(1)
+        self.send_btn = QPushButton("질문하기")
+        self.send_btn.setObjectName("primary")
+        self.send_btn.setToolTip("Ctrl+Enter")
+        self.send_btn.clicked.connect(self.on_send_clicked)
+        send_row.addWidget(self.send_btn)
         lay.addLayout(send_row)
 
     # Ctrl+Enter (or Cmd+Enter) sends; plain Enter inserts a newline.
@@ -764,7 +788,7 @@ class ChatPanel(QWidget):
         self.attach_label = QLabel(
             "작업 결과에서 AI 요약 또는 AI 번역을 선택하세요."
         )
-        self.attach_label.setStyleSheet("color: #7a7a7a;")
+        self.attach_label.setObjectName("contextLabel")
         self.attach_label.setWordWrap(True)
         self.attach_label.setTextFormat(Qt.PlainText)
         lay.addWidget(self.attach_label)
@@ -772,8 +796,8 @@ class ChatPanel(QWidget):
         # First-run model download / load indicator (hidden until needed) —
         # shared because either tab's send can be the trigger.
         self.builtin_status = QLabel("")
+        self.builtin_status.setObjectName("infoText")
         self.builtin_status.setWordWrap(True)
-        self.builtin_status.setStyleSheet("color: #1769aa; font-size: 11px;")
         self.builtin_status.setVisible(False)
         lay.addWidget(self.builtin_status)
         self.dl_bar = QProgressBar()
@@ -840,11 +864,14 @@ class ChatPanel(QWidget):
             self.attach_label.setText(
                 "작업 결과에서 AI 요약 또는 AI 번역을 선택하세요."
             )
-            self.attach_label.setStyleSheet("color: #7a7a7a;")
+            self.attach_label.setProperty("active", False)
+            repolish(self.attach_label)
             return
         names = ", ".join(n for n, _ in self._attached)
         self.attach_label.setText(f"분석 중인 자막: {names}")
-        self.attach_label.setStyleSheet("color: #1b7f3b;")
+        self.attach_label.setToolTip(self._attached_path or names)
+        self.attach_label.setProperty("active", True)
+        repolish(self.attach_label)
 
     def _maybe_auto_save_translation(self, source_path: str, text: str):
         """Save only a completed full translation to its original source path."""
@@ -939,7 +966,7 @@ class ChatPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YouTube 자막 추출기")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1180, 860)
         self.setMinimumSize(680, 440)
 
@@ -950,6 +977,11 @@ class MainWindow(QMainWindow):
         self._running = False
         # Set on close to tell in-flight workers to abort promptly.
         self._shutdown = threading.Event()
+        # Set by the stop button; cleared at the start of every batch.
+        self._cancel = threading.Event()
+        # QSettings store, attached only by main() so tests/selftest never
+        # read or write the user's saved preferences.
+        self._settings = None
         # Whether pywhispercpp imports (probed in a worker thread to avoid
         # blocking startup; defaults to False until the probe finishes).
         self._stt_available = False
@@ -1018,25 +1050,43 @@ class MainWindow(QMainWindow):
 
     def _refresh_queue(self):
         count = self.table.rowCount()
+        statuses = [self._row_status(r) for r in range(count)]
         self.queue_count.setText(f"{count}개")
         self.queue_stack.setCurrentIndex(1 if count else 0)
         self.start_btn.setEnabled(not self._running and any(
-            self._row_status(r) == ST_PENDING for r in range(count)))
+            s in _STARTABLE for s in statuses))
+        self.start_btn.setVisible(not self._running)
+        self.stop_btn.setVisible(self._running)
         self.clear_all_btn.setEnabled(bool(count) and not self._running)
-        self.clear_done_btn.setEnabled(any(self._row_status(r) in
-            (ST_DONE, ST_PARTIAL, ST_ERROR) for r in range(count)))
+        self.clear_done_btn.setEnabled(any(s in _FINISHED for s in statuses))
+        self._refresh_overall(statuses)
         self._refresh_result()
+
+    def _refresh_overall(self, statuses):
+        """Batch progress line under the job list, and the window title."""
+        if self._running:
+            text = f"{self._completed} / {self._total} 완료"
+            self.setWindowTitle(f"({self._completed}/{self._total}) {APP_TITLE}")
+        else:
+            counts = [(statuses.count(s), s) for s in (ST_DONE, ST_PARTIAL, ST_ERROR, ST_CANCELLED)]
+            text = " · ".join(f"{label} {n}" for n, label in counts if n)
+            self.setWindowTitle(APP_TITLE)
+        self.overall_text.setText(text)
+        self.overall_row.setVisible(bool(statuses))
 
     def _refresh_result(self):
         selected = self.table.selectionModel().selectedRows()
         row = selected[0].row() if selected else None
         paths = []
         if row is None or self.table.item(row, COL_TITLE) is None:
-            self.result_title.setText("03   작업 결과")
+            self.result_status.hide()
             self.result_detail.setText("목록에서 작업을 선택하면 진행 상황과 저장 파일을 확인할 수 있습니다.")
         else:
             status = self._row_status(row)
-            self.result_title.setText(f"03   작업 결과 · {status}")
+            self.result_status.setText(status)
+            self.result_status.setProperty("tone", _STATUS_TONES.get(status, "neutral"))
+            repolish(self.result_status)
+            self.result_status.show()
             item = self.table.item(row, COL_DETAIL)
             self.result_detail.setText(item.text() if item and item.text() else "추출 시작을 기다리고 있습니다.")
             paths = self._paths_by_job.get(self._job_id(row), [])
@@ -1176,9 +1226,7 @@ class MainWindow(QMainWindow):
 
     def _set_status_item(self, row: int, status: str):
         item = QTableWidgetItem(status)
-        color = _STATUS_COLORS.get(status)
-        if color:
-            item.setForeground(QBrush(QColor(color)))
+        item.setData(TONE_ROLE, _STATUS_TONES.get(status, "neutral"))
         self.table.setItem(row, COL_STATUS, item)
 
     def _make_progress_bar(self) -> QProgressBar:
@@ -1187,11 +1235,176 @@ class MainWindow(QMainWindow):
         bar.setObjectName("rowProgress")
         bar.setRange(0, 100)
         bar.setValue(0)
-        bar.setTextVisible(True)
-        bar.setFormat("%p%")
-        bar.setAlignment(Qt.AlignCenter)
-        bar.setFixedHeight(20)
+        # The detail column already shows the exact percentage and phase.
+        bar.setTextVisible(False)
         return bar
+
+    def _set_bar_state(self, bar: QProgressBar, state: str):
+        if bar.property("state") != state:
+            bar.setProperty("state", state)
+            repolish(bar)
+
+    def _reset_row(self, row: int):
+        """Return a stopped or failed row to the queue as a fresh job."""
+        self._paths_by_job.pop(self._job_id(row), None)
+        self._set_status_item(row, ST_PENDING)
+        self.table.setItem(row, COL_DETAIL, QTableWidgetItem(""))
+        self.table.setItem(row, COL_FILE, QTableWidgetItem(""))
+        bar = self.table.cellWidget(row, COL_PROGRESS)
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setFormat("")
+        self._set_bar_state(bar, "")
+
+    def _update_url_hint(self):
+        lines = [l.strip() for l in self.url_input.toPlainText().splitlines() if l.strip()]
+        valid = 0
+        for line in lines:
+            try:
+                extract_video_id(line)
+                valid += 1
+            except ExtractionError:
+                pass
+        invalid = len(lines) - valid
+        if not lines:
+            text, tone = "Ctrl+Enter로 추가 · 링크를 창 어디에나 끌어다 놓아도 됩니다.", ""
+        elif invalid:
+            text = f"링크 {valid}개 인식 · {invalid}줄은 YouTube 링크가 아닙니다."
+            tone = "warning"
+        else:
+            text, tone = f"링크 {valid}개 인식 · Ctrl+Enter로 추가", "info"
+        self.url_hint.setText(text)
+        self.url_hint.setProperty("tone", tone)
+        repolish(self.url_hint)
+        self.add_btn.setEnabled(bool(valid) and not self._running)
+
+    # Drag-and-drop: links dropped anywhere on the window join the queue.
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if not self._running and (mime.hasUrls() or mime.hasText()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        links = [u.toString() for u in mime.urls()] if mime.hasUrls() else []
+        if not links and mime.hasText():
+            links = mime.text().splitlines()
+        current = self.url_input.toPlainText().strip()
+        self.url_input.setPlainText("\n".join(filter(None, [current, *links])))
+        event.acceptProposedAction()
+        self.on_add_urls()
+
+    def _show_job_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.table.selectRow(row)
+        status = self._row_status(row)
+        paths = [p for p in self._paths_by_job.get(self._job_id(row), []) if Path(p).exists()]
+        title_item = self.table.item(row, COL_TITLE)
+        url = title_item.data(Qt.UserRole + 1) or title_item.text()
+        menu = QMenu(self)
+        open_file = menu.addAction("파일 열기", lambda: self.on_row_double_clicked(row, 0))
+        open_dir = menu.addAction(
+            "파일 위치 열기",
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(paths[0]).parent))))
+        open_file.setEnabled(bool(paths))
+        open_dir.setEnabled(bool(paths))
+        menu.addAction("YouTube에서 열기", lambda: QDesktopServices.openUrl(QUrl(url)))
+        menu.addAction("링크 복사", lambda: QApplication.clipboard().setText(url))
+        menu.addSeparator()
+        retry = menu.addAction("다시 시도", lambda: self.on_retry_row(row))
+        retry.setEnabled(not self._running and status in (ST_ERROR, ST_CANCELLED))
+        remove = menu.addAction("목록에서 제거", self.on_remove_selected)
+        remove.setShortcut(QKeySequence.Delete)
+        remove.setEnabled(self._removable(row))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _removable(self, row: int) -> bool:
+        status = self._row_status(row)
+        # Pending rows of a running batch already have queued workers.
+        return status != ST_RUNNING and not (self._running and status == ST_PENDING)
+
+    def on_retry_row(self, row: int):
+        if self._running or self._row_status(row) not in (ST_ERROR, ST_CANCELLED):
+            return
+        self._reset_row(row)
+        self._refresh_queue()
+        self.statusBar().showMessage("다시 시도 대기열에 추가했습니다 · 추출 시작을 누르세요", 5000)
+
+    def on_remove_selected(self):
+        rows = sorted({i.row() for i in self.table.selectionModel().selectedRows()}, reverse=True)
+        removed = 0
+        for row in rows:
+            if self._removable(row):
+                self._paths_by_job.pop(self._job_id(row), None)
+                self.table.removeRow(row)
+                removed += 1
+        if removed:
+            self._refresh_queue()
+            self.statusBar().showMessage(f"{removed}개 작업을 목록에서 제거했습니다", 4000)
+
+    def on_stop(self):
+        if not self._running or self._cancel.is_set():
+            return
+        self._cancel.set()
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setText("중지하는 중…")
+        self.statusBar().showMessage("진행 중인 다운로드를 정리하고 남은 작업을 취소하는 중…")
+
+    # ------------------------------------------------------------ settings --
+    _CHECKS = ("transcript_cb", "audio_cb", "video_cb", "manual_cb",
+               "translate_cb", "stt_cb")
+    _COMBOS = ("bitrate_combo", "quality_combo", "stt_model_combo")
+    _SPINS = ("concurrency", "stt_poll_spin", "stt_live_spin")
+
+    def restore_settings(self, settings):
+        """Load saved preferences and remember the store for closeEvent."""
+        self._settings = s = settings
+        geometry = s.value("window/geometry")
+        if geometry:
+            self._initial_size_applied = self.restoreGeometry(geometry)
+        out_dir = s.value("output/dir", "", type=str)
+        if out_dir and Path(out_dir).is_dir():
+            self.out_dir = out_dir
+            self.dir_label.setText(out_dir)
+            self.dir_label.setCursorPosition(0)
+            self.dir_label.setToolTip(out_dir)
+        for name in self._CHECKS:
+            widget = getattr(self, name)
+            widget.setChecked(s.value(f"options/{name}", widget.isChecked(), type=bool))
+        for name in self._COMBOS:
+            widget = getattr(self, name)
+            index = s.value(f"options/{name}", widget.currentIndex(), type=int)
+            if 0 <= index < widget.count():
+                widget.setCurrentIndex(index)
+        for name in self._SPINS:
+            widget = getattr(self, name)
+            widget.setValue(s.value(f"options/{name}", widget.value(), type=int))
+        self.lang_input.setText(s.value("options/langs", self.lang_input.text(), type=str))
+        fmt = s.value("options/format", "", type=str)
+        button = getattr(self, f"_fmt_{fmt}", None) if fmt else None
+        if isinstance(button, QPushButton):
+            button.setChecked(True)
+        self._sync_output_controls()
+
+    def save_settings(self):
+        s = self._settings
+        if s is None:
+            return
+        s.setValue("window/geometry", self.saveGeometry())
+        s.setValue("output/dir", self.out_dir)
+        for name in self._CHECKS:
+            s.setValue(f"options/{name}", getattr(self, name).isChecked())
+        for name in self._COMBOS:
+            s.setValue(f"options/{name}", getattr(self, name).currentIndex())
+        for name in self._SPINS:
+            s.setValue(f"options/{name}", getattr(self, name).value())
+        s.setValue("options/langs", self.lang_input.text())
+        fmt = next(n for n in ("paragraph", "timestamp", "sentence")
+                   if getattr(self, f"_fmt_{n}").isChecked() or n == "sentence")
+        s.setValue("options/format", fmt)
+        s.sync()
 
     def _add_job_row(self, url: str):
         row = self.table.rowCount()
@@ -1228,25 +1441,39 @@ class MainWindow(QMainWindow):
         text = self.url_input.toPlainText()
         added, skipped = 0, 0
         invalid = []
+        queued = set()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, COL_TITLE)
+            try:
+                queued.add(extract_video_id(item.data(Qt.UserRole + 1) or ""))
+            except ExtractionError:
+                pass
+        duplicates = 0
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                extract_video_id(line)  # validate
+                video_id = extract_video_id(line)  # validate
             except ExtractionError:
                 skipped += 1
                 invalid.append(line)
                 continue
+            if video_id in queued:
+                duplicates += 1
+                continue
+            queued.add(video_id)
             self._add_job_row(line)
             added += 1
         self.url_input.setPlainText("\n".join(invalid))
         if added:
             self.table.selectRow(self.table.rowCount() - 1)
-        msg = f"{added}개 추가됨"
+        parts = [f"{added}개 추가됨"] if added else []
+        if duplicates:
+            parts.append(f"이미 목록에 있는 {duplicates}개는 건너뜀")
         if skipped:
-            msg += f", 인식할 수 없는 {skipped}개 링크는 입력창에서 확인하세요"
-        self.statusBar().showMessage(msg)
+            parts.append(f"인식할 수 없는 {skipped}개 링크는 입력창에서 확인하세요")
+        self.statusBar().showMessage(", ".join(parts) or "추가할 링크가 없습니다", 6000)
 
     def on_choose_dir(self):
         d = QFileDialog.getExistingDirectory(self, "저장 폴더 선택", self.out_dir)
@@ -1340,13 +1567,14 @@ class MainWindow(QMainWindow):
                       self.stt_cb, self.stt_poll_spin,
                       self.stt_live_spin, self.stt_model_combo):
                 w.setEnabled(False)
+        self._update_url_hint()
         self._refresh_queue()
 
     def on_start(self):
         if self._running:
             return
         pending = [r for r in range(self.table.rowCount())
-                   if self._row_status(r) == ST_PENDING]
+                   if self._row_status(r) in _STARTABLE]
         if not pending:
             QMessageBox.information(
                 self, "작업 없음", "추출할 대기 항목이 없습니다. URL을 추가하세요."
@@ -1407,6 +1635,12 @@ class MainWindow(QMainWindow):
 
         self.pool.setMaxThreadCount(self.concurrency.value())
 
+        for row in pending:
+            if self._row_status(row) == ST_CANCELLED:
+                self._reset_row(row)
+        self._cancel.clear()
+        self.stop_btn.setEnabled(True)
+        self.stop_btn.setText("중지")
         self._running = True
         self._total = len(pending)
         self._completed = 0
@@ -1415,6 +1649,9 @@ class MainWindow(QMainWindow):
         self._set_controls_enabled(False)
         self.statusBar().showMessage(f"{self._total}개 작업 시작…")
 
+        def should_cancel():
+            return self._shutdown.is_set() or self._cancel.is_set()
+
         for row in pending:
             title_item = self.table.item(row, COL_TITLE)
             url = title_item.data(Qt.UserRole + 1) or title_item.text()
@@ -1422,7 +1659,7 @@ class MainWindow(QMainWindow):
                 self._job_id(row), url, self.out_dir, outputs,
                 langs, prefer_manual, transcript_format, bitrate,
                 translate_to=translate_to,
-                should_cancel=self._shutdown.is_set,
+                should_cancel=should_cancel,
                 video_height=video_height,
                 stt_fallback=stt_fallback,
                 stt_model_size=stt_label,
@@ -1443,10 +1680,12 @@ class MainWindow(QMainWindow):
             if status == ST_RUNNING:
                 bar.setRange(0, 0)
                 bar.setFormat("")
-            elif status in (ST_DONE, ST_PARTIAL, ST_ERROR):
+            elif status in (*_FINISHED, ST_CANCELLED):
+                # The status pill names the outcome; the bar only shows it.
                 bar.setRange(0, 100)
                 bar.setValue(100 if status == ST_DONE else 0)
-                bar.setFormat("완료" if status == ST_DONE else "확인 필요")
+                bar.setFormat("")
+                self._set_bar_state(bar, "done" if status == ST_DONE else "")
             self._refresh_queue()
 
     @Slot(int, str)
@@ -1492,7 +1731,9 @@ class MainWindow(QMainWindow):
             )
             self.table.setItem(row, COL_FILE, item)
 
-        if errors:
+        if result.get("cancelled") and not files:
+            detail = "중지됨 · 추출 시작을 누르면 다시 진행합니다"
+        elif errors:
             detail = "  /  ".join(f"[{lbl}] {msg}" for lbl, msg in errors)
         else:
             detail = "저장 완료"
@@ -1509,14 +1750,21 @@ class MainWindow(QMainWindow):
 
         if self._completed >= self._total:
             self._running = False
+            stopped = self._cancel.is_set()
+            self._cancel.clear()
             self._set_controls_enabled(True)
             statuses = [self._row_status(r) for r in range(self.table.rowCount())]
             n_done = statuses.count(ST_DONE)
             n_partial = statuses.count(ST_PARTIAL)
             n_error = statuses.count(ST_ERROR)
-            self.statusBar().showMessage(
-                f"완료: 성공 {n_done}개, 부분 완료 {n_partial}개, 실패 {n_error}개"
-            )
+            summary = f"성공 {n_done}개, 부분 완료 {n_partial}개, 실패 {n_error}개"
+            if stopped:
+                summary = f"중지됨 · {summary}, 취소 {statuses.count(ST_CANCELLED)}개"
+            else:
+                summary = f"완료: {summary}"
+            self.statusBar().showMessage(summary)
+            # Flash the taskbar entry when a long batch ends in the background.
+            QApplication.alert(self)
         self._refresh_queue()
 
     def closeEvent(self, event):
@@ -1534,6 +1782,10 @@ class MainWindow(QMainWindow):
         # Signal workers to abort, drop anything still queued, and give the
         # running ones a moment to unwind cooperatively. The chat panel has its
         # own pool (and its own download/inference worker), so drain both.
+        try:
+            self.save_settings()
+        except Exception:
+            pass  # preferences are a convenience; never block shutdown on them
         self._shutdown.set()
         self.pool.clear()
         # Disconnect the STT probe signal proactively: a probe worker may still
@@ -1695,8 +1947,17 @@ def main():
         i = sys.argv.index("--screenshot")
         out = sys.argv[i + 1] if i + 1 < len(sys.argv) else "screenshot.png"
         sys.exit(_run_screenshot(out))
+    if os.name == "nt":
+        # Own taskbar identity so Windows shows the app icon, not python.exe's.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "Mazeline.YouTubeTranscriptExtractor")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
-    app.setApplicationName("YouTube 자막 추출기")
+    app.setApplicationName(APP_TITLE)
+    app.setOrganizationName("Mazeline")
     from .theme import apply_theme
     apply_theme(app)
 
@@ -1705,29 +1966,41 @@ def main():
     splash.show()
     app.processEvents()
 
+    from PySide6.QtCore import QSettings
     win = MainWindow()
+    win.restore_settings(QSettings("Mazeline", "YouTubeTranscriptExtractor"))
+    restored = getattr(win, "_initial_size_applied", False)
     win.show()
     app.processEvents()
 
-    # Always open on primary monitor (frameGeometry is valid after show)
-    primary = app.primaryScreen().availableGeometry()
-    fg = win.frameGeometry()
-    win.move(
-        primary.x() + (primary.width() - fg.width()) // 2,
-        primary.y() + (primary.height() - fg.height()) // 2,
-    )
+    if not restored:
+        # First run opens on the primary monitor (frameGeometry is valid after show)
+        primary = app.primaryScreen().availableGeometry()
+        fg = win.frameGeometry()
+        win.move(
+            primary.x() + (primary.width() - fg.width()) // 2,
+            primary.y() + (primary.height() - fg.height()) // 2,
+        )
 
-    QTimer.singleShot(3000, lambda: splash.finish(win))
+    # Brief hand-off so the splash doesn't flicker; the window is already usable.
+    QTimer.singleShot(900, lambda: splash.finish(win))
 
     from yt_extractor.updater import UpdateChecker
+
+    def _offer_update(version):
+        box = QMessageBox(win)
+        box.setWindowTitle("업데이트 사용 가능")
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"새 버전 {version}이(가) 출시됐습니다.")
+        box.setInformativeText("다운로드 페이지에서 최신 설치 파일을 받을 수 있습니다.")
+        download = box.addButton("다운로드 페이지 열기", QMessageBox.AcceptRole)
+        box.addButton("나중에", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is download:
+            QDesktopServices.openUrl(QUrl("https://mazeline.tech/"))
+
     _checker = UpdateChecker()
-    _checker.update_available.connect(
-        lambda v: QMessageBox.information(
-            win, "업데이트 사용 가능",
-            f"새 버전 {v} 이(가) 출시됐습니다.\n"
-            "https://mazeline.tech/ 에서 다운로드하세요.",
-        )
-    )
+    _checker.update_available.connect(_offer_update)
     _checker.start()
 
     # Eagerly load the built-in model now so it's ready (and stays resident)

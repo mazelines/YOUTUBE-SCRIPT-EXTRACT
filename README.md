@@ -9,7 +9,24 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 
 ![YouTube 자막 추출기 — 영상 추가, 작업 목록, 결과 확인으로 구성한 새 UI](docs/screenshot.png)
 
-*Windows에서 직접 캡처한 실행 화면입니다.*
+*1.2.1 배포 ZIP을 풀고 EXE를 실행해 캡처한 메인 화면입니다.*
+
+<details>
+<summary>앱 시작 화면 보기</summary>
+
+![1.2.1 앱 시작 화면](docs/screenshot-splash.png)
+
+</details>
+
+## Windows 다운로드 및 실행
+
+1. [1.2.1 릴리스](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.2.1)에서 `YouTubeTranscriptExtractor.zip`을 내려받습니다.
+2. ZIP **전체를 압축 해제**하고 `YouTubeTranscriptExtractor.exe`를 실행합니다. EXE와 `_internal` 폴더는 함께 보관해야 합니다.
+3. YouTube 링크를 넣고 **작업 추가 → 추출 시작**을 누릅니다. 기본 선택인 `자막 MD + SRT`는 읽기용 Markdown과 원문 타임스탬프를 보존한 SRT를 함께 저장합니다.
+
+배포 ZIP에는 Python 실행 환경, Node.js, FFmpeg 및 AI 추론 엔진이 포함됩니다. AI 모델 가중치는 첫 사용 시 별도로 다운로드하며, 이미 받은 모델은 업데이트 후에도 재사용합니다. ZIP 크기는 **181.3 MiB**이며 릴리스에 `SHA256SUMS.txt`를 함께 제공합니다.
+
+**1.2.1 변경 사항:** 요약·번역용 CPU 전용 엔진을 Vulkan 지원 엔진으로 교체했습니다. 실제 사용 GPU와 적재된 레이어 수를 AI 작업 공간에 표시하며, GPU를 사용할 수 없으면 사유와 함께 CPU로 실행합니다.
 
 ## 개발 언어 및 기술 구성
 
@@ -18,7 +35,8 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 | 주요 개발 언어 | Python 3.10 이상 |
 | 데스크톱 UI | PySide6 / Qt 6 |
 | 자막·영상 처리 | youtube-transcript-api, yt-dlp, FFmpeg, Node.js / EJS |
-| 내장 AI·음성 인식 | llama-cpp-python, pywhispercpp |
+| 내장 AI | llama-cpp-python 0.3.34 / Vulkan, Gemma 4 E4B Instruct Q4_K_M |
+| 음성 인식 | pywhispercpp / whisper.cpp, 기본 모델 `small` |
 | 빌드·실행 스크립트 | PowerShell, Windows Batch, PyInstaller |
 
 프로젝트 라이선스는 **[MIT](LICENSE)**입니다. 포함된 라이브러리와 AI 모델에는 각 구성요소의 라이선스가 적용됩니다.
@@ -36,6 +54,10 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 - **작업 중심 화면** — 영상 추가 → 작업 목록 → 결과 확인 순서로 구성, 고급 설정은 별도 창에서 조절
 - **실시간 진행 표시** — 작업별 상태와 측정 가능한 진행률 표시, 처리량을 알 수 없는 단계는 진행 중으로 안내
 - **결과 파일 선택** — 선택한 작업의 MD·SRT·MP3·MP4와 저장된 AI 번역을 골라 열거나 파일 위치 확인
+- **중지 · 다시 시도** — 진행 중인 일괄 작업을 중지하고 취소된 작업은 다시 시작, 실패한 작업은 우클릭 메뉴에서 다시 시도
+- **끌어다 놓기 · 중복 방지** — 링크를 창에 끌어다 놓으면 목록에 추가, 이미 목록에 있는 영상은 건너뜀
+- **설정 기억** — 저장 위치, 저장 형식, 고급 설정, 창 크기·위치를 다음 실행 때 그대로 복원
+- **단축키** — `Ctrl+Enter` 추가 · `Ctrl+R`/`F5` 추출 시작 · `Ctrl+L` 링크 입력 · `Ctrl+O` 저장 폴더 · `Ctrl+,` 고급 설정 · `Ctrl+J` AI 작업 공간 · `Delete` 선택 작업 제거
 - **스플래시 화면** — 메인 UI와 같은 디자인의 [시작 화면](docs/screenshot-splash.png), 로딩 애니메이션과 버전 표시
 - **자동 업데이트 확인** — 시작 시 백그라운드로 최신 버전 확인
 
@@ -45,15 +67,34 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 
 ![실제 YouTube 자막 추출 완료 후 내장 모델로 요약한 화면](docs/screenshot-ai.png)
 
+*1.2.1에서 실제 자막을 요약한 화면입니다. AI 작업 공간에 사용 GPU와 적재 레이어 수가 표시됩니다.*
+
 - **요약 탭** — 자막 핵심 내용을 한국어로 요약
 - **번역 탭** — 자막 전체를 한국어로 번역, 완료 시 자동으로 `.ko.md` 파일로 저장 (체크박스 옵션)
-- **기본 제공자** — 앱 내장 모델(**Gemma 4 E4B**, Apache-2.0), 첫 사용 시 Hugging Face에서 자동 다운로드(약 5.3GB), 이후 오프라인 동작
-- **GPU 가속** — 1.2.1부터 Vulkan 지원 엔진을 동봉합니다. 실제 GPU 배치가 확인되면 장치 이름과 GPU 레이어 수를 표시하고, GPU를 사용할 수 없으면 CPU 실행 사유를 표시합니다. 1.2.0의 요약·번역 엔진은 CPU 전용이었습니다.
+- **기본 제공자** — 앱 내장 모델(**Gemma 4 E4B Instruct, Q4_K_M**, Apache-2.0), 첫 사용 시 Hugging Face에서 자동 다운로드(약 5.3GB), 이후 오프라인 동작. 모델 파일은 `gemma-4-E4B-it-Q4_K_M.gguf`입니다.
+- **GPU 가속** — 1.2.1부터 Vulkan 지원 엔진을 동봉합니다. 실제 GPU 적재가 확인되면 장치 이름과 GPU 레이어 수를 표시하고, GPU를 사용할 수 없으면 CPU 실행 사유를 표시합니다. 1.2.0의 요약·번역 엔진은 CPU 전용이었습니다.
 - **내장 모델 사용** — 현재 앱 UI는 별도 API 키 없이 내장 모델로 동작
 
-### llama-cpp-python 설치 (내장 모델 사용 시)
+### 실제 GPU 추론 검증
 
-**GPU 개발 환경**: 일반 `pip install -r requirements-ai.txt`만으로는 GPU 지원이 보장되지 않습니다. [공식 설치 안내](https://github.com/abetlen/llama-cpp-python#installation)의 Vulkan 빌드 옵션을 사용해야 합니다. Visual Studio x64 C++ 도구와 LunarG Vulkan SDK가 설치된 PowerShell에서 아래 스크립트로 고정 버전의 GPU 휠을 빌드한 뒤 설치하세요.
+최종 1.2.1 ZIP을 별도 폴더에 풀고, 배포 EXE에서 모델을 로드해 실제 한국어 텍스트를 생성했습니다.
+
+| 검증 항목 | 결과 |
+|-----------|------|
+| 추론 장치 / 백엔드 | NVIDIA GeForce RTX 4090 / Vulkan |
+| GPU 적재 레이어 | **43 / 43** |
+| GPU 모델 버퍼 | **2868.04 MiB** |
+| 짧은 번역 생성 | 모델 준비 후 **2.216초** |
+| CPU 대체 실행 | 강제 CPU 설정 및 GPU 사용 불가 조건에서 실제 추론 성공 |
+| 자동 테스트 / 배포 검사 | 76개 테스트 통과, EXE 자체 검사 통과 |
+
+측정 결과는 [GPU-VALIDATION.json](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/download/release-1.2.1/GPU-VALIDATION.json)에서 확인할 수 있습니다. 생성 시간에는 모델 다운로드·로딩·워밍업이 포함되지 않으며, 전체 자막 요약·번역 시간은 입력 길이와 장치에 따라 달라집니다. 위 수치는 RTX 4090에서 확인한 결과입니다.
+
+AI 작업 공간에 `GPU · NVIDIA GeForce RTX 4090 · 43/43 레이어`처럼 표시되면 실제 GPU 적재가 확인된 상태입니다. 모델 로딩이 끝나기 전에는 GPU 사용 여부를 확정하지 않습니다.
+
+### GPU 엔진 설치 (소스 개발 환경)
+
+배포 EXE에는 GPU 엔진이 포함되어 있어 별도 빌드가 필요 없습니다. 소스에서 개발할 경우 일반 `pip install -r requirements-ai.txt`만으로는 GPU 지원이 보장되지 않습니다. **1.2.1 이상 소스**와 Visual Studio x64 C++ 도구(CMake/Ninja 포함), LunarG Vulkan SDK가 준비된 PowerShell에서 실행하세요.
 
 ```powershell
 ./scripts/build-gpu-engine.ps1 -Python .venv/Scripts/python.exe -VulkanSdk 'C:/VulkanSDK/<설치 버전>'
@@ -61,19 +102,11 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 .venv/Scripts/python.exe run.py --gpu-selftest
 ```
 
-`--gpu-selftest`는 이미 다운로드된 모델로 실제 추론을 수행하고, 모든 레이어의 GPU 배치와 출력 생성을 확인합니다. `GPU_SELFTEST_OUT` 환경변수로 JSON 결과 경로를 지정할 수 있습니다. 실행 장치 진단은 모델 캐시 폴더의 `model-runtime.json`에도 기록됩니다. `YT_EXTRACTOR_FORCE_CPU=1`로 CPU 실행을 명시할 수 있습니다.
+빌드 스크립트는 `llama-cpp-python==0.3.34`에 Vulkan과 AVX2를 활성화하고 AVX512를 비활성화합니다. 긴 경로 때문에 설치가 실패하면 동봉한 `enable_long_paths.bat`을 관리자 권한으로 실행한 뒤 다시 시도하세요.
 
-릴리스 스크립트는 EXE에 Vulkan 백엔드가 없으면 패키징을 중단합니다. GPU가 없는 컴퓨터에서는 동봉된 CPU 백엔드로 실행할 수 있습니다.
+`--gpu-selftest`는 **이미 다운로드된 모델**로 실제 추론을 수행하고, 모든 레이어의 GPU 적재와 출력 생성을 확인합니다. CPU 실행이면 검증 실패로 종료합니다. `GPU_SELFTEST_OUT` 환경변수로 JSON 결과 저장 경로를 지정할 수 있습니다.
 
-> **Windows Long Path 필수**: llama-cpp-python이 vendoring하는 `llama.cpp` 트리에 260자를 넘는 Svelte 경로가 있어, 기본 Windows에서는 `OSError: [Errno 2] No such file or directory: ...ChatAttachmentsListItemMcpPrompt.svelte`로 설치가 실패합니다. 동봉된 **`enable_long_paths.bat`**을 한 번 실행(관리자 권한, UAC 승인)하면 시스템 전체에 long path가 활성화되어 재부팅 없이 해결됩니다. Python 3.6+ 인스톨러는 이미 `longPathAware` 매니페스트를 포함하므로 레지스트리만 켜면 pip이 자동으로 긴 경로를 처리합니다.
-
-> **AVX512 주의**: 사전빌드 휠은 AVX512로 컴파일돼 있어 대부분의 컨슈머 CPU에서 죽습니다. 반드시 **AVX2 소스 빌드**하세요.
-
-```bash
-# Windows (MSVC + CMake/Ninja 필요)
-set CMAKE_ARGS=-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DCMAKE_C_FLAGS=/utf-8 -DCMAKE_CXX_FLAGS=/utf-8
-pip install "llama-cpp-python>=0.3.0" --no-binary llama-cpp-python --no-cache-dir
-```
+모델과 실행 장치 진단 파일은 `%LOCALAPPDATA%\YouTubeTranscriptExtractor\models`에 저장합니다. `model-runtime.json`에는 마지막 모델 로딩 프로세스의 PID와 실행 장치가 기록되므로, 현재 앱 상태는 AI 작업 공간의 표시와 함께 확인하세요. CPU 실행을 강제하려면 앱을 시작하기 전에 `$env:YT_EXTRACTOR_FORCE_CPU = '1'`을 설정합니다.
 
 ## STT 폴백 / 라이브 영상 지원
 
@@ -114,7 +147,9 @@ STT 엔진은 AI 채팅(llama.cpp)과 **같은 ggml 스택**인 whisper.cpp입�
 
 ## 설치 및 실행
 
-**원클릭 (Windows, 권장)** — `run_dev.bat`을 더블클릭하면 가상환경(`.venv`) 생성 + 전체 의존성(자막/MP3/MP4 + AI 채팅 + STT 폴백) 설치 후 GUI가 자동 실행됩니다. 두 번째 실행부터는 설치를 건너뛰고 바로 뜹니다.
+일반 사용자는 위의 [Windows 다운로드 및 실행](#windows-다운로드-및-실행)을 따르세요. 아래는 **소스 개발 환경**을 위한 안내입니다.
+
+**개발용 실행 (Windows)** — `run_dev.bat`을 더블클릭하면 가상환경(`.venv`) 생성과 의존성 설치를 진행한 뒤 GUI를 실행합니다. GPU 지원 엔진은 앞의 [GPU 엔진 설치](#gpu-엔진-설치-소스-개발-환경) 절차로 별도 준비해야 합니다.
 
 ```bat
 run_dev.bat                 :: 더블클릭 또는 터미널에서 실행 → GUI 실행
@@ -143,6 +178,8 @@ Windows 배포 ZIP에는 Node.js와 EJS가 포함되므로 사용자가 따로 �
 빌드 환경에도 Node.js 22 이상이 필요합니다. 빌드 시 해당 Node 버전의 라이선스를
 공식 저장소에서 받아 실행 파일과 함께 포함합니다(이후 로컬 캐시 사용).
 
+먼저 빌드에 사용할 가상환경에 Vulkan 지원 AI 엔진을 설치하세요. `release.ps1`은 EXE 자체 검사에서 Vulkan 백엔드 포함 여부를 확인하며, CPU 전용 엔진이면 ZIP 생성을 중단합니다. 이 검사는 파일 포함 여부를 확인하므로, 실제 GPU 추론은 아래 명령으로 별도 검증합니다.
+
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python -m pip install pyinstaller
@@ -153,10 +190,16 @@ python -m pip install pyinstaller
 .\scripts\release.ps1 -Versioned  # dist/에 날짜별 ZIP도 추가 생성
 ```
 
-빌드 검증:
-```bash
-dist\YouTubeTranscriptExtractor\YouTubeTranscriptExtractor.exe --selftest
+빌드 검증 (모델을 미리 다운로드한 GPU 환경):
+
+```powershell
+& .\dist\YouTubeTranscriptExtractor\YouTubeTranscriptExtractor.exe --selftest --require-gpu-backend
+$env:GPU_SELFTEST_OUT = Join-Path $PWD 'dist/GPU-VALIDATION.json'
+Start-Process -FilePath .\dist\YouTubeTranscriptExtractor\YouTubeTranscriptExtractor.exe -ArgumentList '--gpu-selftest' -WindowStyle Hidden -Wait
+Get-Content -Encoding UTF8 $env:GPU_SELFTEST_OUT
 ```
+
+GPU 검증 결과의 `ok: true`와 `runtime` 항목을 확인하세요. 배포 전에는 생성된 ZIP을 별도 폴더에 풀어 동일한 검증을 수행합니다.
 
 ## 별도 수동 FTP 업로드
 
@@ -217,7 +260,9 @@ YOUTUBE-SCRIPT-EXTRACTOR/
 ├── requirements.txt
 ├── YouTubeTranscriptExtractor.spec   # PyInstaller 빌드 스펙
 ├── scripts/
-│   └── deploy.py                 # 빌드 ZIP 패킹 + FTP 배포
+│   ├── build-gpu-engine.ps1      # Vulkan 지원 AI 엔진 휠 빌드
+│   ├── release.ps1               # EXE 빌드·자체 검사·로컬 ZIP 생성
+│   └── deploy.py                 # 별도로 실행하는 기존 FTP 도구
 ├── ftp-config.example.json       # FTP 설정 템플릿
 └── yt_extractor/
     ├── __init__.py               # 버전 정보
@@ -227,6 +272,8 @@ YOUTUBE-SCRIPT-EXTRACTOR/
     ├── core.py                   # 추출 로직 (URL 파싱·자막·MP3·MP4·마크다운·폴백)
     ├── chat_render.py            # AI 채팅 HTML 렌더러
     ├── local_llm.py              # 내장 llama-cpp-python LLM 래퍼
+    ├── gpu_runtime.py            # 실제 GPU 적재 로그 수집·실행 장치 진단
+    ├── gpu_selftest.py           # 모델 GPU 적재 및 실제 추론 검사
     ├── stt.py                    # (선택) whisper.cpp(pywhispercpp) STT 래퍼 — 자막 없는/라이브 영상
     ├── splash.py                 # 스플래시 화면
     ├── updater.py                # 업데이트 확인 (백그라운드 QThread)

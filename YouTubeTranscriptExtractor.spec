@@ -21,8 +21,8 @@ import subprocess
 from urllib.request import urlopen
 
 datas = [("yt_extractor/img/mazelinebanner.jpg", "yt_extractor/img")]
-datas += [("yt_extractor/img/chevron-down.svg", "yt_extractor/img"),
-          ("yt_extractor/img/chevron-up.svg", "yt_extractor/img")]
+# Theme icons (checkbox, chevrons, dock buttons) and the window/app icon.
+datas += [("yt_extractor/img/*.svg", "yt_extractor/img")]
 datas += collect_data_files("imageio_ffmpeg")        # ffmpeg binary
 
 hiddenimports = collect_submodules("yt_dlp")          # dynamic extractors
@@ -111,7 +111,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon="yt_extractor/img/app.ico",
 )
 
 coll = COLLECT(
