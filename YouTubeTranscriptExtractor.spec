@@ -20,6 +20,8 @@ import subprocess
 from urllib.request import urlopen
 
 datas = [("yt_extractor/img/mazelinebanner.jpg", "yt_extractor/img")]
+datas += [("yt_extractor/img/chevron-down.svg", "yt_extractor/img"),
+          ("yt_extractor/img/chevron-up.svg", "yt_extractor/img")]
 datas += collect_data_files("imageio_ffmpeg")        # ffmpeg binary
 
 hiddenimports = collect_submodules("yt_dlp")          # dynamic extractors
