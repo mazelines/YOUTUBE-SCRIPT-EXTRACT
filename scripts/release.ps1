@@ -1,18 +1,11 @@
-# Release pipeline: clean -> build -> selftest -> zip -> publish to Google Drive.
-#
-# The Drive folder is mounted locally by Google Drive Desktop, so "upload" is
-# just a Copy-Item — no API, no auth. Override the target with -DriveDir if
-# the user has Drive mounted on a different letter.
-#
+# Release pipeline: clean -> build -> selftest -> local ZIP.
 # Usage:
-#   .\scripts\release.ps1                    # clean build, zip, copy as latest
-#   .\scripts\release.ps1 -Versioned         # also drop a timestamped archive
-#   .\scripts\release.ps1 -SkipBuild         # just re-zip and re-copy the existing dist/
-#   .\scripts\release.ps1 -DriveDir 'X:\...' # override Drive target
+#   .\scripts\release.ps1             # build, verify, package in dist/
+#   .\scripts\release.ps1 -Versioned  # also create a timestamped ZIP in dist/
+#   .\scripts\release.ps1 -SkipBuild  # verify and repackage existing dist/
 
 [CmdletBinding()]
 param(
-    [string]$DriveDir   = 'I:\GoogleDireve\PublicShare\YoutubeExtractor',
     [string]$AppName    = 'YouTubeTranscriptExtractor',
     [string]$SpecFile   = 'YouTubeTranscriptExtractor.spec',
     [switch]$Versioned,
@@ -32,7 +25,16 @@ function Write-Fail($msg) { Write-Host "ERR $msg" -ForegroundColor Red }
 if (-not $SkipBuild) {
     Write-Step 'Cleaning build/ and dist/'
     foreach ($d in @('build', 'dist')) {
-        if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+        $target = [IO.Path]::GetFullPath((Join-Path $projectRoot $d))
+        if ((Split-Path -Parent $target) -ne [IO.Path]::GetFullPath($projectRoot)) {
+            throw "Cleanup target outside project: $target"
+        }
+        if (Test-Path -LiteralPath $target) {
+            if ((Get-Item -LiteralPath $target).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to clean a linked directory: $target"
+            }
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
     }
 }
 
@@ -64,7 +66,7 @@ if (-not $SkipSelftest) {
     $selftestOut = Join-Path $projectRoot '_selftest_release.txt'
     if (Test-Path $selftestOut) { Remove-Item $selftestOut }
     $env:SELFTEST_OUT = $selftestOut
-    Start-Process -FilePath $exePath -ArgumentList '--selftest' -Wait
+    Start-Process -FilePath $exePath -ArgumentList '--selftest' -WindowStyle Hidden -Wait
     Remove-Item Env:\SELFTEST_OUT
     if (-not (Test-Path $selftestOut)) {
         Write-Fail 'Selftest produced no result file'
@@ -74,7 +76,7 @@ if (-not $SkipSelftest) {
     Write-Host $result
     Remove-Item $selftestOut
     if ($result -notmatch 'SELFTEST OK') {
-        Write-Fail 'Selftest did not pass — aborting publish'
+        Write-Fail 'Selftest did not pass — aborting packaging'
         exit 1
     }
     Write-Ok 'Selftest passed'
@@ -89,29 +91,18 @@ Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath
 $zipSize = (Get-Item $zipPath).Length
 Write-Ok ("Zip: {0} ({1:N1} MB)" -f $zipPath, ($zipSize / 1MB))
 
-# --- 5) Publish to Google Drive (local mount) --------------------------------
-if (-not (Test-Path $DriveDir)) {
-    Write-Fail "Drive target missing: $DriveDir (is Google Drive Desktop running?)"
-    exit 1
-}
-
-Write-Step "Copying to $DriveDir"
-Copy-Item -Path $zipPath -Destination (Join-Path $DriveDir $zipName) -Force
-Write-Ok "Published: $DriveDir\$zipName"
-
+# --- 5) Optional local archive ----------------------------------------------
 if ($Versioned) {
-    $stamp   = Get-Date -Format 'yyyyMMdd-HHmm'
-    $archive = "$AppName-$stamp.zip"
-    Copy-Item -Path $zipPath -Destination (Join-Path $DriveDir $archive) -Force
-    Write-Ok "Archived: $DriveDir\$archive"
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $archivePath = Join-Path $projectRoot "dist\$AppName-$stamp.zip"
+    Copy-Item -LiteralPath $zipPath -Destination $archivePath -Force
+    Write-Ok "Archived: $archivePath"
 }
 
 # --- 6) Report ---------------------------------------------------------------
-$driveItem = Get-Item (Join-Path $DriveDir $zipName)
+$zipItem = Get-Item -LiteralPath $zipPath
 Write-Host ''
-Write-Host '── Release published ─────────────────────────────────────────' -ForegroundColor Green
-Write-Host ("  File : {0}" -f $driveItem.FullName)
-Write-Host ("  Size : {0:N1} MB" -f ($driveItem.Length / 1MB))
-Write-Host ("  Time : {0}" -f $driveItem.LastWriteTime)
-Write-Host '  Sync : Google Drive Desktop will push to the shared folder automatically.'
-Write-Host '──────────────────────────────────────────────────────────────'
+Write-Host 'Release package ready' -ForegroundColor Green
+Write-Host ("  File : {0}" -f $zipItem.FullName)
+Write-Host ("  Size : {0:N1} MB" -f ($zipItem.Length / 1MB))
+Write-Host ("  Time : {0}" -f $zipItem.LastWriteTime)

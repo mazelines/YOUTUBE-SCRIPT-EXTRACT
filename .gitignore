@@ -26,7 +26,9 @@ design_handoff_lime_forward/
 
 .agents/
 
-tests/
+.zcode/
+
+.pytest_cache/
 
 *.log
 

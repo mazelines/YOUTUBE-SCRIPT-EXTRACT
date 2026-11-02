@@ -18,6 +18,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl, QTimer,
+    QStandardPaths,
 )
 from PySide6.QtGui import QDesktopServices, QBrush, QColor, QPixmap
 from PySide6.QtWidgets import (
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 from .core import (
     extract_video_id,
     extract_to_markdown,
+    extract_to_markdown_with_fallback,
     extract_audio_mp3,
     extract_video,
     ExtractionError,
@@ -96,9 +98,9 @@ def _force_kill_process_tree():
 class WorkerSignals(QObject):
     """Signals emitted by an ExtractWorker, marshalled to the GUI thread."""
 
-    status = Signal(int, str)             # row, status label
-    detail = Signal(int, str)             # row, progress/error message
-    finished = Signal(int, object)        # row, result dict {files, errors}
+    status = Signal(int, str)             # job ID, status label
+    detail = Signal(int, str)             # job ID, progress/error message
+    finished = Signal(int, object)        # job ID, result dict {files, errors}
 
 
 class ExtractWorker(QRunnable):
@@ -107,12 +109,15 @@ class ExtractWorker(QRunnable):
     `outputs` selects what to produce: any of {"transcript", "audio", "video"}.
     """
 
-    def __init__(self, row: int, url: str, out_dir: str, outputs: set,
+    def __init__(self, job_id: int, url: str, out_dir: str, outputs: set,
                  langs, prefer_manual: bool, transcript_format: str, bitrate: str,
                  translate_to: str | None = None, should_cancel=None,
-                 video_height: int = 1080):
+                 video_height: int = 1080,
+                 stt_fallback: bool = False, stt_model_size: str = "small",
+                 poll_wait_min: float = 0.0,
+                 live_capture_minutes: float = 0.0):
         super().__init__()
-        self.row = row
+        self.job_id = job_id
         self.url = url
         self.out_dir = out_dir
         self.outputs = outputs
@@ -123,6 +128,10 @@ class ExtractWorker(QRunnable):
         self.video_height = video_height
         self.translate_to = translate_to
         self.should_cancel = should_cancel
+        self.stt_fallback = stt_fallback
+        self.stt_model_size = stt_model_size
+        self.poll_wait_min = poll_wait_min
+        self.live_capture_minutes = live_capture_minutes
         self.signals = WorkerSignals()
 
     def _cancelled(self) -> bool:
@@ -130,22 +139,41 @@ class ExtractWorker(QRunnable):
 
     @Slot()
     def run(self):
-        row = self.row
+        job_id = self.job_id
         if self._cancelled():
             return
-        self.signals.status.emit(row, ST_RUNNING)
+        self.signals.status.emit(job_id, ST_RUNNING)
         files, errors = [], []
 
         if "transcript" in self.outputs and not self._cancelled():
             try:
-                paths = extract_to_markdown(
-                    self.url, self.out_dir,
-                    preferred_langs=self.langs,
-                    prefer_manual=self.prefer_manual,
-                    transcript_format=self.transcript_format,
-                    translate_to=self.translate_to,
-                    progress=lambda m: self.signals.detail.emit(row, f"[자막] {m}"),
-                )
+                # Use the fallback pipeline whenever STT or polling is
+                # requested; otherwise fall back to the original one-shot
+                # extract_to_markdown to keep behaviour identical for users
+                # who don't opt in.
+                if self.stt_fallback or self.poll_wait_min > 0:
+                    paths = extract_to_markdown_with_fallback(
+                        self.url, self.out_dir,
+                        preferred_langs=self.langs,
+                        prefer_manual=self.prefer_manual,
+                        transcript_format=self.transcript_format,
+                        translate_to=self.translate_to,
+                        stt_fallback=self.stt_fallback,
+                        stt_model_size=self.stt_model_size,
+                        poll_wait_min=self.poll_wait_min,
+                        live_capture_minutes=self.live_capture_minutes,
+                        progress=lambda m: self.signals.detail.emit(job_id, m),
+                        should_cancel=self.should_cancel,
+                    )
+                else:
+                    paths = extract_to_markdown(
+                        self.url, self.out_dir,
+                        preferred_langs=self.langs,
+                        prefer_manual=self.prefer_manual,
+                        transcript_format=self.transcript_format,
+                        translate_to=self.translate_to,
+                        progress=lambda m: self.signals.detail.emit(job_id, f"[자막] {m}"),
+                    )
                 for i, p in enumerate(paths):
                     label = "자막" if i == 0 else f"번역({self.translate_to})"
                     files.append((label, str(p)))
@@ -158,7 +186,7 @@ class ExtractWorker(QRunnable):
             try:
                 path = extract_audio_mp3(
                     self.url, self.out_dir, bitrate=self.bitrate,
-                    progress=lambda m: self.signals.detail.emit(row, f"[MP3] {m}"),
+                    progress=lambda m: self.signals.detail.emit(job_id, f"[MP3] {m}"),
                     should_cancel=self.should_cancel,
                 )
                 files.append(("MP3", str(path)))
@@ -171,7 +199,7 @@ class ExtractWorker(QRunnable):
             try:
                 path = extract_video(
                     self.url, self.out_dir, height=self.video_height,
-                    progress=lambda m: self.signals.detail.emit(row, f"[영상] {m}"),
+                    progress=lambda m: self.signals.detail.emit(job_id, f"[영상] {m}"),
                     should_cancel=self.should_cancel,
                 )
                 files.append(("MP4", str(path)))
@@ -181,22 +209,23 @@ class ExtractWorker(QRunnable):
                 errors.append(("MP4", f"예기치 못한 오류: {e}"))
 
         if errors and files:
-            self.signals.status.emit(row, ST_PARTIAL)
+            self.signals.status.emit(job_id, ST_PARTIAL)
         elif errors:
-            self.signals.status.emit(row, ST_ERROR)
+            self.signals.status.emit(job_id, ST_ERROR)
         else:
-            self.signals.status.emit(row, ST_DONE)
-        self.signals.finished.emit(row, {"files": files, "errors": errors})
+            self.signals.status.emit(job_id, ST_DONE)
+        self.signals.finished.emit(job_id, {"files": files, "errors": errors})
 
 
 class BuiltinSignals(QObject):
     """Signals for the bundled CPU model worker (download + inference)."""
 
     status = Signal(str)          # high-level phase, e.g. "모델 로딩 중…"
-    progress = Signal(int, int)   # downloaded, total bytes (first-run download)
+    progress = Signal(object, object)   # downloaded, total bytes (first-run download)
     chunk = Signal(int, int)      # current, total chunks (chunked translation)
     token = Signal(str)           # streamed text delta
     done = Signal()
+    cancelled = Signal()
     error = Signal(str)
 
 
@@ -237,6 +266,7 @@ class BuiltinWorker(QRunnable):
                     should_cancel=self._cancel.is_set,
                 )
             if self._cancel.is_set():
+                self.signals.cancelled.emit()
                 return
             # The model is normally preloaded at startup, so this is just
             # inference. Only say "로딩 중" if it actually isn't resident yet
@@ -259,7 +289,10 @@ class BuiltinWorker(QRunnable):
         except Exception as e:  # pragma: no cover - defensive
             self.signals.error.emit(f"예기치 못한 오류: {e}")
             return
-        self.signals.done.emit()
+        if self._cancel.is_set():
+            self.signals.cancelled.emit()
+        else:
+            self.signals.done.emit()
 
     def _run_chunked(self):
         """Translate each chunk as its own request, streamed as one answer.
@@ -316,6 +349,49 @@ class PreloadWorker(QRunnable):
 
 
 BANNER_URL = "https://mazeline.tech/"
+
+
+def _default_output_dir() -> str:
+    """Return a writable default output folder.
+
+    Installed builds run from Program Files, so a cwd-relative default can make
+    extraction fail when the app tries to create or write transcripts there.
+    Prefer Documents, then AppData, and only fall back to cwd if it is the first
+    writable option in the current environment.
+    """
+    candidates = []
+    docs = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+    if docs:
+        candidates.append(Path(docs) / "YouTubeTranscriptExtractor" / "transcripts")
+
+    app_data = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
+    if app_data:
+        candidates.append(Path(app_data) / "transcripts")
+
+    candidates.extend([
+        Path.home() / "YouTubeTranscriptExtractor" / "transcripts",
+        Path.cwd() / "transcripts",
+    ])
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-test"
+            probe.write_text("ok", encoding="utf-8")
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return str(candidate)
+        except OSError:
+            continue
+
+    return str(candidates[0])
 
 
 def _resource_base():
@@ -419,15 +495,15 @@ class ChatTab(QWidget):
     """
 
     def __init__(self, panel: "ChatPanel", quick_label: str, quick_prompt: str,
-                 placeholder: str = "", manual_instruction: str | None = None):
+                 placeholder: str = ""):
         super().__init__()
         self.panel = panel
         self.quick_prompt = quick_prompt
-        self.manual_instruction = manual_instruction
         self._history: list[dict] = []
         self._worker: BuiltinWorker | None = None
         self._streaming_assistant: str | None = None
         self._last_error: str | None = None
+        self._translation_path: str | None = None
         # Coalesce stream-driven re-renders (~80 ms) so a fast model doesn't
         # trigger one setHtml() per token.
         self._render_timer = QTimer(self)
@@ -478,13 +554,13 @@ class ChatTab(QWidget):
         lay.addLayout(quick)
 
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("메시지 입력 (Ctrl+Enter 전송)")
+        self.input.setPlaceholderText("결과에 대한 추가 질문 입력 (Ctrl+Enter: 질문하기)")
         self.input.setMaximumHeight(80)
         self.input.installEventFilter(self)
         lay.addWidget(self.input)
 
         send_row = QHBoxLayout()
-        self.send_btn = QPushButton("전송")
+        self.send_btn = QPushButton("질문하기")
         self.send_btn.setStyleSheet("font-weight: bold;")
         self.send_btn.clicked.connect(self.on_send_clicked)
         send_row.addWidget(self.send_btn)
@@ -515,31 +591,35 @@ class ChatTab(QWidget):
                 "'AI로 번역'을 눌러 불러오세요.",
             )
             return
-        self._send(self.quick_prompt)
+        self._send(self.quick_prompt,
+                   translate_full=(self is self.panel.translate_tab))
 
     def on_send_clicked(self):
         text = self.input.toPlainText().strip()
         if not text:
             return
         self.input.clear()
-        if self.manual_instruction:
-            text = f"{self.manual_instruction}\n\n{text}"
+        # Follow-up question on the summary/translation result: send as a plain
+        # chat turn over history + transcript context. No manual_instruction
+        # prepend, no chunking — the model answers the question asked.
         self._send(text)
 
-    def _send(self, text: str):
+    def _send(self, text: str, *, translate_full: bool = False):
         if self._worker is not None:
             QMessageBox.information(self, "응답 대기 중",
                                     "현재 답변이 끝난 뒤 보내주세요.")
             return
         panel = self.panel
-        # Translate tab: translate the transcript body (header metadata
-        # excluded) under the strict translation-only prompt, split into chunks
-        # so a long video can't overflow the model's n_ctx and get truncated.
-        # The results stream back as one continuous answer. A short transcript
-        # is just a single chunk through the same path, so behaviour is uniform.
-        is_translate = self is panel.translate_tab
+        self._translation_path = panel._attached_path if translate_full else None
+        # Initial translation (quick button or 'AI로 번역'): translate the
+        # transcript body (header metadata excluded) under the strict
+        # translation-only prompt, split into chunks so a long video can't
+        # overflow the model's n_ctx and get truncated. Results stream back as
+        # one continuous answer. Follow-up questions (질문하기) never take this
+        # path — they go through the normal chat-completion array, so the model
+        # answers the question instead of re-translating the whole transcript.
         chunks = None
-        if is_translate and panel._attached:
+        if translate_full and panel._attached:
             body = transcript_body("\n\n".join(t for _, t in panel._attached if t))
             chunks = split_for_translation(body) or None
 
@@ -561,6 +641,7 @@ class ChatTab(QWidget):
         worker.signals.chunk.connect(self._on_chunk)
         worker.signals.token.connect(self._on_token)
         worker.signals.done.connect(self._on_done)
+        worker.signals.cancelled.connect(self._on_cancelled)
         worker.signals.error.connect(self._on_error)
         self._worker = worker
         panel.start_chat_worker(worker)
@@ -601,11 +682,17 @@ class ChatTab(QWidget):
         self._worker = None
         self._set_busy(False)
         self._rerender()
-        if self is self.panel.translate_tab:
-            self.panel._maybe_auto_save_translation()
+        if self._translation_path:
+            self.panel._maybe_auto_save_translation(self._translation_path, answer)
+        self._translation_path = None
+
+    @Slot()
+    def _on_cancelled(self):
+        self._on_error("작업이 취소되었습니다.")
 
     @Slot(str)
     def _on_error(self, msg: str):
+        self._translation_path = None
         self.panel._hide_builtin_ui()
         self._render_timer.stop()
         # Drop the user turn we optimistically recorded so retry isn't doubled.
@@ -746,10 +833,9 @@ class ChatPanel(QWidget):
         self.translate_tab = ChatTab(
             self, "🌐 자막 번역 시작", TRANSLATE_PROMPT,
             placeholder=(
-                "왼쪽에서 자막을 추출해 'AI로 번역'을 누르거나, "
-                "여기에 번역할 부분을 입력하세요."
+                "왼쪽에서 자막을 추출해 'AI로 번역'을 누르세요. "
+                "번역 결과에 대한 추가 질문은 여기에 입력하세요."
             ),
-            manual_instruction="다음 내용을 자연스러운 한국어로 번역해 주세요:",
         )
         self.tabs.addTab(self.summary_tab, "📝 요약")
         self.tabs.addTab(self.translate_tab, "🌐 번역")
@@ -767,12 +853,18 @@ class ChatPanel(QWidget):
         """
         target = (self.summary_tab if summarize else
                   self.translate_tab if translate else None)
-        # Don't swap context out from under that tab's in-flight answer.
-        if target is not None and target._worker is not None:
+        changed = self._attached != [(name, text)] or self._attached_path != path
+        # Both tabs share context; never replace it while either is running.
+        if ((changed and any(t._worker is not None for t in
+                            (self.summary_tab, self.translate_tab)))
+                or (target is not None and target._worker is not None)):
             QMessageBox.information(
                 self, "응답 대기 중", "현재 답변이 끝난 뒤 다시 시도하세요."
             )
             return
+        if changed:
+            self.summary_tab.on_reset()
+            self.translate_tab.on_reset()
         self._attached = [(name, text)]
         self._attached_path = path
         self._refresh_context_label()
@@ -781,7 +873,7 @@ class ChatPanel(QWidget):
             self.summary_tab._send(SUMMARY_PROMPT)
         elif translate:
             self.tabs.setCurrentWidget(self.translate_tab)
-            self.translate_tab._send(TRANSLATE_PROMPT)
+            self.translate_tab._send(TRANSLATE_PROMPT, translate_full=True)
 
     def _refresh_context_label(self):
         if not self._attached:
@@ -795,21 +887,13 @@ class ChatPanel(QWidget):
         self.attach_label.setText(f"📎 컨텍스트: {names}")
         self.attach_label.setStyleSheet("color: #1b7f3b;")
 
-    def _maybe_auto_save_translation(self):
-        """Save the translate tab's last AI response as a .ko.md file if the checkbox is on."""
-        if not self.mw.translate_cb.isChecked():
+    def _maybe_auto_save_translation(self, source_path: str, text: str):
+        """Save only a completed full translation to its original source path."""
+        if not self.mw.translate_cb.isChecked() or not text.strip():
             return
-        if not self._attached_path:
-            return
-        history = self.translate_tab._history
-        assistant_turns = [t["content"] for t in history if t.get("role") == "assistant"]
-        if not assistant_turns:
-            return
-        text = assistant_turns[-1].strip()
-        if not text:
-            return
+        text = text.strip()
         try:
-            src = Path(self._attached_path)
+            src = Path(source_path)
             out_path = src.with_suffix(".ko.md")
             out_path.write_text(text, encoding="utf-8")
             self.mw.statusBar().showMessage(f"번역 저장됨: {out_path.name}", 5000)
@@ -828,12 +912,12 @@ class ChatPanel(QWidget):
             self.dl_bar.setFormat("")
             self.dl_bar.setVisible(True)
 
-    @Slot(int, int)
+    @Slot(object, object)
     def _on_builtin_progress(self, done: int, total: int):
         self.dl_bar.setVisible(True)
         if total > 0:
-            self.dl_bar.setRange(0, total)
-            self.dl_bar.setValue(done)
+            self.dl_bar.setRange(0, 100)
+            self.dl_bar.setValue(min(100, max(0, done * 100 // total)))
             self.dl_bar.setFormat(f"{done / 1e6:.0f} / {total / 1e6:.0f} MB  (%p%)")
         else:
             self.dl_bar.setRange(0, 0)  # indeterminate (unknown size)
@@ -898,14 +982,18 @@ class MainWindow(QMainWindow):
         self.resize(1200, 980)
 
         self.pool = QThreadPool.globalInstance()
-        self.out_dir = str(Path.cwd() / "transcripts")
+        self.out_dir = _default_output_dir()
         self._total = 0
         self._completed = 0
         self._running = False
         # Set on close to tell in-flight workers to abort promptly.
         self._shutdown = threading.Event()
+        # Whether pywhispercpp imports (probed in a worker thread to avoid
+        # blocking startup; defaults to False until the probe finishes).
+        self._stt_available = False
 
         self._build_ui()
+        self._probe_stt_async()
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self):
@@ -1013,23 +1101,73 @@ class MainWindow(QMainWindow):
         self.bitrate_combo.setCurrentIndex(1)  # 192
         opt.addWidget(self.bitrate_combo, 3, 3)
 
-        opt.addWidget(QLabel("영상 화질:"), 5, 2)
+        opt.addWidget(QLabel("영상 화질:"), 3, 4)
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(["1080p", "720p", "원본(최고화질)"])
         self.quality_combo.setCurrentIndex(0)  # 1080p
-        opt.addWidget(self.quality_combo, 5, 3)
+        opt.addWidget(self.quality_combo, 3, 5)
 
         self.translate_cb = QCheckBox("🌐 한국어 번역도 함께 저장 (.ko.md)")
         self.translate_cb.setToolTip(
             "원문이 한국어가 아닐 때, YouTube의 번역 자막을 별도 '.ko.md' "
             "파일로 함께 저장합니다. 번역 자막이 없는 영상은 원문만 저장합니다."
         )
-        opt.addWidget(self.translate_cb, 4, 0, 1, 4)
+        opt.addWidget(self.translate_cb, 4, 0, 1, 6)
+
+        # --- STT fallback (자막이 없는 영상 / 라이브 영상 처리) ---
+        self.stt_cb = QCheckBox("🎙 자막 없으면 STT로 자동 생성 (Whisper)")
+        self.stt_cb.setToolTip(
+            "YouTube 자막이 없을 때 음성을 내려받아 내장 Whisper(whisper.cpp)로 "
+            "텍스트를 생성합니다. 라이브 영상도 지정한 시간만큼 캡처해 변환합니다. "
+            "GPU(Vulkan)가 있으면 자동으로 가속됩니다. "
+            "소스 실행 시 pywhispercpp 설치 필요: requirements-stt.txt 참고"
+        )
+        opt.addWidget(self.stt_cb, 5, 0, 1, 2)
+
+        opt.addWidget(QLabel("자막 대기:"), 5, 2)
+        self.stt_poll_spin = QSpinBox()
+        self.stt_poll_spin.setRange(0, 180)
+        # Default 0 = "don't poll, go straight to STT/none". Polling only helps
+        # when YouTube is *about* to publish captions (a live that's still being
+        # transcribed); for a fully caption-less VOD it just wastes minutes. Users
+        # who want polling opt in by raising this value.
+        self.stt_poll_spin.setValue(0)
+        self.stt_poll_spin.setSuffix(" 분")
+        self.stt_poll_spin.setToolTip(
+            "YouTube가 자동 자막을 생성할 때까지 대기하는 최대 시간. "
+            "0(기본)이면 대기 없이 바로 다음 단계로 넘어갑니다. "
+            "STT와 독립적으로 동작합니다."
+        )
+        opt.addWidget(self.stt_poll_spin, 5, 3)
+
+        opt.addWidget(QLabel("STT 모델:"), 5, 4)
+        self.stt_model_combo = QComboBox()
+        self.stt_model_combo.addItems(
+            ["tiny (빠름)", "base", "small (권장)", "medium", "large-v3 (정확)"]
+        )
+        self.stt_model_combo.setCurrentIndex(2)  # small
+        self.stt_model_combo.setToolTip(
+            "클수록 정확하지만 느리고 메모리를 많이 씁니다. small은 다국어/한국어 "
+            "모두 잘 처리합니다."
+        )
+        opt.addWidget(self.stt_model_combo, 5, 5)
+
+        opt.addWidget(QLabel("라이브 캡처:"), 6, 2)
+        self.stt_live_spin = QSpinBox()
+        self.stt_live_spin.setRange(0, 480)
+        self.stt_live_spin.setValue(60)
+        self.stt_live_spin.setSuffix(" 분")
+        self.stt_live_spin.setToolTip(
+            "라이브 영상에서 현재까지 방송된 구간(처음부터 N분)을 캡처해 "
+            "STT로 변환합니다. 0이면 라이브는 건너뜁니다."
+        )
+        opt.addWidget(self.stt_live_spin, 6, 3)
 
         # Enable/disable dependent controls with their output type.
         self.transcript_cb.toggled.connect(self._sync_output_controls)
         self.audio_cb.toggled.connect(self._sync_output_controls)
         self.video_cb.toggled.connect(self._sync_output_controls)
+        self.stt_cb.toggled.connect(self._sync_output_controls)
         self._sync_output_controls()
 
         root.addWidget(opt_group)
@@ -1114,7 +1252,8 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("준비됨")
 
-        self._paths_by_row: dict[int, str] = {}
+        self._paths_by_job: dict[int, list[str]] = {}
+        self._next_job_id = 0
 
     # ------------------------------------------------------------- helpers --
     def _sync_output_controls(self):
@@ -1127,6 +1266,84 @@ class MainWindow(QMainWindow):
         self.translate_cb.setEnabled(want_t)
         self.bitrate_combo.setEnabled(want_a)
         self.quality_combo.setEnabled(self.video_cb.isChecked())
+        # STT controls only make sense when transcript output is selected.
+        stt_enabled = want_t and self._stt_available
+        self.stt_cb.setEnabled(stt_enabled)
+        stt_active = stt_enabled and self.stt_cb.isChecked()
+        # Polling is independent of STT — it waits for YouTube to publish
+        # captions. It only needs transcript output on, so it follows want_t
+        # rather than stt_active (otherwise turning STT off would lock the
+        # polling value too, even though polling doesn't need STT at all).
+        self.stt_poll_spin.setEnabled(want_t)
+        # Live capture and model size feed STT, so they stay gated on STT on.
+        self.stt_live_spin.setEnabled(stt_active)
+        self.stt_model_combo.setEnabled(stt_active)
+
+    def _probe_stt_async(self):
+        """Detect pywhispercpp off the UI thread so import cost never blocks.
+
+        Importing pywhispercpp loads the whisper.cpp native extension (can be
+        slow on a cold HDD). We run it on a worker thread and flip
+        ``_stt_available`` + re-sync controls on the GUI thread when done. If
+        unavailable, the STT checkbox stays disabled with its tooltip
+        explaining how to install it.
+
+        The signal QObject is kept alive on ``self`` (not just on the worker)
+        because Qt deletes C++ signal sources when their Python wrapper is
+        garbage-collected — a worker-local signal can vanish before the
+        cross-thread emit is delivered.
+        """
+        from PySide6.QtCore import QObject as _QObj
+
+        class _ProbeSignal(_QObj):
+            done = Signal(bool)
+
+        class _Probe(QRunnable):
+            def __init__(inner, signal):
+                super().__init__()
+                inner.sig = signal
+
+            @Slot()
+            def run(inner):
+                try:
+                    from .stt import is_stt_available
+                    avail = is_stt_available()
+                except Exception:
+                    avail = False
+                try:
+                    inner.sig.done.emit(avail)
+                except RuntimeError:
+                    # Window closed while we probed — the signal's C++ side
+                    # is already deleted. Nothing to deliver to; drop it.
+                    pass
+
+        # Keep a strong reference on self for the worker's lifetime.
+        self._stt_probe_sig = _ProbeSignal()
+        self._stt_probe_sig.done.connect(self._on_stt_probe)
+        self.pool.start(_Probe(self._stt_probe_sig))
+
+    @Slot(bool)
+    def _on_stt_probe(self, available: bool):
+        # The probe runs on a background thread; the user may close the window
+        # while it's still importing pywhispercpp (slow on a cold HDD). By
+        # the time the queued `done` signal is delivered, either this MainWindow
+        # or one of the widgets below can already be torn down — accessing them
+        # raises RuntimeError ("wrapped C/C++ object of type X has been
+        # deleted") or, worse, aborts the process from PySide6 internals.
+        # Guard every widget touch so a late probe result never crashes exit.
+        try:
+            self._stt_available = bool(available)
+            if not self._stt_available:
+                self.stt_cb.setChecked(False)
+                self.stt_cb.setToolTip(
+                    "STT 구성요소(pywhispercpp)가 설치되어 있지 않아 STT 폴백을 "
+                    "사용할 수 없습니다.\n설치: requirements-stt.txt의 안내 참고"
+                )
+            self._sync_output_controls()
+        except RuntimeError:
+            # Window/widgets already destroyed by shutdown — drop the late
+            # probe result silently.
+            pass
 
     def _set_status_item(self, row: int, status: str):
         item = QTableWidgetItem(status)
@@ -1150,11 +1367,23 @@ class MainWindow(QMainWindow):
     def _add_job_row(self, url: str):
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, COL_TITLE, QTableWidgetItem(url))
+        item = QTableWidgetItem(url)
+        item.setData(Qt.UserRole, self._next_job_id)
+        self._next_job_id += 1
+        self.table.setItem(row, COL_TITLE, item)
         self._set_status_item(row, ST_PENDING)
         self.table.setCellWidget(row, COL_PROGRESS, self._make_progress_bar())
         self.table.setItem(row, COL_DETAIL, QTableWidgetItem(""))
         self.table.setItem(row, COL_FILE, QTableWidgetItem(""))
+
+    def _job_id(self, row: int) -> int:
+        return self.table.item(row, COL_TITLE).data(Qt.UserRole)
+
+    def _job_row(self, job_id: int) -> int | None:
+        for row in range(self.table.rowCount()):
+            if self._job_id(row) == job_id:
+                return row
+        return None
 
     def _row_status(self, row: int) -> str:
         item = self.table.item(row, COL_STATUS)
@@ -1194,6 +1423,7 @@ class MainWindow(QMainWindow):
     def on_clear_done(self):
         for row in range(self.table.rowCount() - 1, -1, -1):
             if self._row_status(row) in (ST_DONE, ST_ERROR):
+                self._paths_by_job.pop(self._job_id(row), None)
                 self.table.removeRow(row)
 
     def on_clear_all(self):
@@ -1201,11 +1431,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "진행 중", "작업이 끝난 뒤 지워주세요.")
             return
         self.table.setRowCount(0)
+        self._paths_by_job.clear()
         self.progress.setValue(0)
         self.progress.setMaximum(0)
 
     def on_row_double_clicked(self, row: int, _col: int):
-        paths = self._paths_by_row.get(row) or []
+        paths = self._paths_by_job.get(self._job_id(row)) or []
         for path in paths:
             if path and Path(path).exists():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -1214,13 +1445,13 @@ class MainWindow(QMainWindow):
     def _selected_transcript_path(self):
         """The .md transcript to summarize: the selected row's, else newest."""
         selected = [i.row() for i in self.table.selectionModel().selectedRows()]
-        order = selected + sorted(self._paths_by_row, reverse=True)
+        order = selected + list(range(self.table.rowCount() - 1, -1, -1))
         seen = set()
         for row in order:
             if row in seen:
                 continue
             seen.add(row)
-            for p in self._paths_by_row.get(row, []):
+            for p in self._paths_by_job.get(self._job_id(row), []):
                 if p.lower().endswith(".md") and Path(p).exists():
                     return p
         return None
@@ -1262,7 +1493,9 @@ class MainWindow(QMainWindow):
         else:
             for w in (self.lang_input, self.manual_cb, self._fmt_sentence,
                       self._fmt_paragraph, self._fmt_timestamp,
-                      self.translate_cb, self.bitrate_combo, self.quality_combo):
+                      self.translate_cb, self.bitrate_combo, self.quality_combo,
+                      self.stt_cb, self.stt_poll_spin,
+                      self.stt_live_spin, self.stt_model_combo):
                 w.setEnabled(False)
 
     def on_start(self):
@@ -1305,6 +1538,27 @@ class MainWindow(QMainWindow):
         q = self.quality_combo.currentText()
         video_height = int(q[:-1]) if q.endswith("p") else 0
         translate_to = "ko" if self.translate_cb.isChecked() else None
+        # STT fallback options. Only active when the user opted in *and* the
+        # backend is importable — otherwise pass disabled values so the worker
+        # takes the legacy one-shot path.
+        want_transcript = self.transcript_cb.isChecked()
+        stt_fallback = want_transcript and self.stt_cb.isChecked() and self.stt_cb.isEnabled()
+        # Map the human-readable combo entry back to a model size token
+        # Whisper understands ("small (권장)" -> "small").
+        stt_label = self.stt_model_combo.currentText().split(" ")[0]
+        if stt_label not in ("tiny", "base", "small", "medium", "large-v3"):
+            stt_label = "small"
+        # Polling and STT are INDEPENDENT: a user may want one without the
+        # other. Polling is only meaningful when transcript output is selected;
+        # otherwise it'd wait on captions for nothing. We do NOT tie it to the
+        # STT checkbox — that was the old bug, where enabling STT silently
+        # forced a 30-minute poll first.
+        poll_wait_min = float(self.stt_poll_spin.value()) if want_transcript else 0.0
+        # Live capture only makes sense together with STT (it's the audio
+        # source for STT on a live stream), so it stays gated on stt_fallback.
+        live_capture_minutes = (
+            float(self.stt_live_spin.value()) if stt_fallback else 0.0
+        )
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
 
         self.pool.setMaxThreadCount(self.concurrency.value())
@@ -1320,11 +1574,15 @@ class MainWindow(QMainWindow):
         for row in pending:
             url = self.table.item(row, COL_TITLE).text()
             worker = ExtractWorker(
-                row, url, self.out_dir, outputs,
+                self._job_id(row), url, self.out_dir, outputs,
                 langs, prefer_manual, transcript_format, bitrate,
                 translate_to=translate_to,
                 should_cancel=self._shutdown.is_set,
                 video_height=video_height,
+                stt_fallback=stt_fallback,
+                stt_model_size=stt_label,
+                poll_wait_min=poll_wait_min,
+                live_capture_minutes=live_capture_minutes,
             )
             worker.signals.status.connect(self._on_worker_status)
             worker.signals.detail.connect(self._on_worker_detail)
@@ -1332,39 +1590,48 @@ class MainWindow(QMainWindow):
             self.pool.start(worker)
 
     @Slot(int, str)
-    def _on_worker_status(self, row: int, status: str):
-        self._set_status_item(row, status)
+    def _on_worker_status(self, job_id: int, status: str):
+        row = self._job_row(job_id)
+        if row is not None:
+            self._set_status_item(row, status)
 
     @Slot(int, str)
-    def _on_worker_detail(self, row: int, msg: str):
+    def _on_worker_detail(self, job_id: int, msg: str):
+        row = self._job_row(job_id)
+        if row is None:
+            return
         self.table.setItem(row, COL_DETAIL, QTableWidgetItem(msg))
-        self._update_mp3_progress(row, msg)
+        self._update_row_progress(row, msg)
 
-    def _update_mp3_progress(self, row: int, msg: str):
-        """Drive a row's MP3 bar from its [MP3] progress message.
+    def _update_row_progress(self, row: int, msg: str):
+        """Drive a row's progress bar from an [MP3]/[STT]/[폴링] detail message.
 
-        Tracks the download percentage; once downloading finishes ("변환 중")
-        the encode step reports no progress, so we peg the bar to 100%.
+        Percentage messages advance the bar; terminal phases ("변환 중", "저장
+        완료", "다운로드 완료") peg it to 100%. Anything without a known signal
+        is left alone so the bar doesn't jitter.
         """
-        if "[MP3]" not in msg:
+        if not any(tag in msg for tag in ("[MP3]", "[STT]", "[폴링]")):
             return
         bar = self.table.cellWidget(row, COL_PROGRESS)
         if bar is None:
             return
         m = _PCT_RE.search(msg)
         if m:
-            bar.setValue(int(float(m.group(1))))
-        elif "변환 중" in msg or "저장 완료" in msg:
+            bar.setValue(min(100, int(float(m.group(1)))))
+        elif any(k in msg for k in (
+            "변환 중", "저장 완료", "다운로드 완료", "마크다운 저장",
+        )):
             bar.setValue(100)
 
     @Slot(int, object)
-    def _on_worker_finished(self, row: int, result: dict):
+    def _on_worker_finished(self, job_id: int, result: dict):
+        row = self._job_row(job_id)
         files = result.get("files", [])
         errors = result.get("errors", [])
 
-        if files:
+        if files and row is not None:
             # Remember paths for double-click (open the first produced file).
-            self._paths_by_row[row] = [p for _label, p in files]
+            self._paths_by_job[job_id] = [p for _label, p in files]
             names = "  |  ".join(f"{lbl}: {Path(p).name}" for lbl, p in files)
             item = QTableWidgetItem(names)
             item.setToolTip(
@@ -1376,7 +1643,8 @@ class MainWindow(QMainWindow):
             detail = "  /  ".join(f"[{lbl}] {msg}" for lbl, msg in errors)
         else:
             detail = "저장 완료"
-        self.table.setItem(row, COL_DETAIL, QTableWidgetItem(detail))
+        if row is not None:
+            self.table.setItem(row, COL_DETAIL, QTableWidgetItem(detail))
 
         self._completed += 1
         self.progress.setValue(self._completed)
@@ -1412,6 +1680,18 @@ class MainWindow(QMainWindow):
         # own pool (and its own download/inference worker), so drain both.
         self._shutdown.set()
         self.pool.clear()
+        # Disconnect the STT probe signal proactively: a probe worker may still
+        # be importing pywhispercpp when the window closes, and its queued
+        # `done` emit would otherwise land on a torn-down MainWindow. Even
+        # though _on_stt_probe guards with try/except, dropping the connection
+        # here means the emit becomes a no-op instead of relying on the slot
+        # to catch the fallout. Best-effort — the signal/widget may already be
+        # gone if closeEvent fires twice.
+        try:
+            if getattr(self, "_stt_probe_sig", None) is not None:
+                self._stt_probe_sig.done.disconnect(self._on_stt_probe)
+        except (RuntimeError, AttributeError):
+            pass
         event.accept()
         ext_done = self.pool.waitForDone(4000)
         chat_done = self.chat.shutdown(timeout=4000)
@@ -1460,18 +1740,40 @@ def _run_selftest() -> int:
     except Exception as e:
         llama_status = f"llama_cpp absent ({e.__class__.__name__})"
 
+    # STT fallback engine is likewise optional. Report presence/absence for
+    # build verification, but never fail the selftest over it.
+    try:
+        import pywhispercpp  # noqa: F401
+        # The package doesn't export __version__; ask pip metadata instead.
+        from importlib.metadata import version as _pkg_version
+        try:
+            _pw_ver = _pkg_version("pywhispercpp")
+        except Exception:
+            _pw_ver = "?"
+        stt_status = f"pywhispercpp {_pw_ver}"
+    except Exception as e:
+        stt_status = f"pywhispercpp absent ({e.__class__.__name__})"
+
     # Instantiate the GUI offscreen to confirm widgets/resources load.
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         app = QApplication(sys.argv)
         win = MainWindow()
+        out_dir = Path(win.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        probe = out_dir / ".selftest-write"
+        probe.write_text("ok", encoding="utf-8")
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
         win.show()
         app.processEvents()
     except Exception as e:
-        problems.append(f"GUI instantiation failed: {e}")
+        problems.append(f"GUI/output setup failed: {e}")
 
     result = "SELFTEST OK" if not problems else "SELFTEST FAIL: " + "; ".join(problems)
-    result += f" | {llama_status}"
+    result += f" | {llama_status} | {stt_status}"
     out = os.environ.get("SELFTEST_OUT")
     if out:
         try:

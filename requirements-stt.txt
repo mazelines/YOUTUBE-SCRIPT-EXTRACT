@@ -1,0 +1,39 @@
+# Optional: STT 폴백 (자막 없는 영상 / 라이브 영상 처리).
+# llama-cpp-python(AI 채팅)과 마찬가지로 핵심 설치에 불필요 — STT 기능을
+# 원할 때만 별도로 설치하세요.
+#
+# 자막이 없는 VOD 또는 자막 생성 전 라이브 영상에서 음성을 다운로드해
+# whisper.cpp(pywhispercpp)로 텍스트를 생성합니다. AI 채팅(llama.cpp)과 같은
+# ggml 스택이라 하나의 Vulkan 빌드로 NVIDIA/AMD/Intel GPU를 모두 가속합니다.
+# 첫 사용 시 선택한 모델(tiny/base/small/medium/large-v3)을 Hugging Face
+# (ggerganov/whisper.cpp)에서 받아
+# %LOCALAPPDATA%/YouTubeTranscriptExtractor/stt-models 아래에 캐싱합니다.
+#
+# ★ RECOMMENDED: Vulkan 소스 빌드 (llama-cpp-python과 같은 절차) ★★★★★★★★★★
+# GPU가 없는 머신에서는 whisper.cpp가 자동으로 AVX2 CPU 백엔드로 폴백하므로
+# 하나의 빌드가 GPU/CPU를 모두 커버합니다 (one-install-covers-both).
+#   1) LunarG Vulkan SDK 설치 (https://vulkan.lunarg.com) — glslc, 헤더,
+#      vulkan-1.lib 제공. VULKAN_SDK 환경변수가 설정돼 있어야 합니다.
+#   2) VS x64 dev shell에서 (MSVC + CMake/Ninja):
+#      set CMAKE_GENERATOR=Ninja
+#      set CMAKE_ARGS=-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_C_FLAGS=/utf-8 -DCMAKE_CXX_FLAGS=/utf-8
+#      pip install pywhispercpp --no-binary pywhispercpp --no-cache-dir
+#
+# ⚠ BUILD_SHARED_LIBS=OFF(정적 링크)는 필수. llama-cpp-python도 자기 버전의
+#   ggml DLL(ggml-base.dll 등)을 싣는데, Windows는 DLL을 이름으로 먼저 찾아
+#   같은 이름의 공유 DLL 두 벌이 한 프로세스에서 충돌합니다. 정적 링크는
+#   whisper.cpp+ggml을 확장 모듈(.pyd) 안에 넣어 충돌을 원천 차단합니다.
+#
+# ⚠ 제너레이터는 반드시 Ninja. MSBuild(VS) 제너레이터는 ggml의
+#   vulkan-shaders-gen 하위 빌드가 컴파일러를 못 찾아 실패합니다. 또한 빌드
+#   경로가 길면 FileTracker(FTK1011)가 실패하니 TMP/TEMP를 짧은 경로(예:
+#   D:\bt)로 지정하세요.
+#
+# GPU 가속 없이 CPU로만 쓸 거라면 아래 한 줄 설치(pip install -r
+# requirements-stt.txt, PyPI CPU 휠)로도 STT는 동작합니다.
+#
+# 런타임 제어: 환경변수 STT_USE_GPU=0 으로 GPU를 강제 비활성화.
+# (구 faster-whisper 시절의 STT_USE_CUDA / nvidia-* CUDA 휠(~600MB)은 더 이상
+#  사용하지 않습니다 — Vulkan 빌드가 이를 대체합니다.)
+
+pywhispercpp>=1.2
