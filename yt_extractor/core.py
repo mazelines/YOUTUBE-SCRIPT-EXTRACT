@@ -5,6 +5,8 @@ front-ends."""
 from __future__ import annotations
 
 import os
+import sys
+import shutil
 import re
 import json
 import tempfile
@@ -41,6 +43,23 @@ _HOSTS = {
 
 class ExtractionError(Exception):
     """Raised when a transcript cannot be extracted, with a friendly message."""
+
+
+def _youtube_runtime_opts() -> dict:
+    """Use the bundled Node runtime, or a local installation during development.
+
+    yt-dlp enables only Deno by default. Node must be explicitly enabled for
+    the packaged EJS scripts to solve YouTube's player challenges.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        node = Path(base) / "node" / "node.exe"
+        if node.is_file():
+            return {"js_runtimes": {"node": {"path": str(node)}}}
+    node = shutil.which("node")
+    if node:
+        return {"js_runtimes": {"node": {"path": node}}}
+    return {}  # yt-dlp can still use Deno from PATH when installed.
 
 
 def extract_video_id(url_or_id: str) -> str:
@@ -521,12 +540,45 @@ def safe_filename(
     return f"{base} [{video_id}]{tag}.md"
 
 
-def save_markdown(content: str, out_dir: str | Path, filename: str) -> Path:
+def build_srt(result: TranscriptResult) -> str:
+    """Preserve source cues and timing, without Markdown sentence processing.
+
+    Overlapping YouTube captions are kept as supplied. Only timestamps are
+    rounded to SRT's millisecond precision; text is not translated or merged.
+    """
+    def timestamp(seconds: float) -> str:
+        total = max(0, round(seconds * 1000))
+        hours, rest = divmod(total, 3_600_000)
+        minutes, rest = divmod(rest, 60_000)
+        seconds, millis = divmod(rest, 1000)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+    cues = []
+    for text, start, duration in result.snippets:
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            continue
+        cues.append(
+            f"{len(cues) + 1}\n"
+            f"{timestamp(start)} --> {timestamp(start + max(0, duration))}\n{text}\n\n"
+        )
+    return "".join(cues)
+
+
+def _save_text(content: str, out_dir: str | Path, filename: str) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / filename
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def save_markdown(content: str, out_dir: str | Path, filename: str) -> Path:
+    return _save_text(content, out_dir, filename)
+
+
+def save_srt(result: TranscriptResult, out_dir: str | Path, filename: str) -> Path:
+    return _save_text(build_srt(result), out_dir, filename)
 
 
 # --------------------------------------------------------------------------- #
@@ -556,7 +608,8 @@ def extract_to_markdown(
     caption, only the original is saved (no error raised).
 
     `progress` is an optional callable(str) for status messages. Returns the
-    list of written file paths (1 or 2). Raises ExtractionError on any handled
+    list of written file paths (original MD, original SRT, optional translated MD).
+    Raises ExtractionError on any handled
     failure of the primary extraction.
     """
     def report(msg):
@@ -581,6 +634,7 @@ def extract_to_markdown(
         include_timestamps=include_timestamps,
     )
     written = [save_markdown(content, out_dir, safe_filename(meta.title, video_id))]
+    written.append(save_srt(result, out_dir, written[0].with_suffix(".srt").name))
 
     if translate_to:
         target = translate_to.strip().lower()
@@ -728,6 +782,7 @@ def is_live_video(video_id: str, timeout: float = 8.0) -> bool:
         return False
     opts = {"quiet": True, "no_warnings": True, "skip_download": True,
             "noplaylist": True}
+    opts.update(_youtube_runtime_opts())
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(canonical_url(video_id), download=False) or {}
@@ -848,6 +903,7 @@ def _capture_live_audio(*, ydl_module, video_id, out_dir, capture_minutes,
         "quiet": True, "no_warnings": True, "skip_download": True,
         "noplaylist": True, "format": "bestaudio/best",
     }
+    ydl_opts.update(_youtube_runtime_opts())
     try:
         with ydl_module.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(canonical_url(video_id), download=False)
@@ -1028,8 +1084,8 @@ def extract_to_markdown_with_fallback(
 
     STT requires pywhispercpp (whisper.cpp); if it's missing the function
     raises an ExtractionError explaining how to install it, rather than
-    silently producing nothing. Returns 1-2 written paths (original +
-    translation when ``translate_to`` is set).
+    silently producing nothing. Returns original MD and SRT paths, plus an
+    optional translated MD when ``translate_to`` is set.
     """
     def report(msg):
         if progress:
@@ -1201,6 +1257,8 @@ def extract_to_markdown_with_fallback(
         written = [save_markdown(content, out_dir, stt_name)]
     else:
         written = [save_markdown(content, out_dir, safe_filename(meta.title, video_id))]
+
+    written.append(save_srt(result, out_dir, written[0].with_suffix(".srt").name))
 
     if translate_to and not is_stt_origin:
         # Translation only makes sense for YouTube-sourced captions (we can
@@ -1378,6 +1436,7 @@ def _download(
         "postprocessor_hooks": [postproc_hook],
     }
     ydl_opts.update(extra_opts)
+    ydl_opts.update(_youtube_runtime_opts())
     ydl_opts.update(_download_accel_opts())
     ffloc = _ffmpeg_location()
     if ffloc:
