@@ -98,9 +98,9 @@ def _force_kill_process_tree():
 class WorkerSignals(QObject):
     """Signals emitted by an ExtractWorker, marshalled to the GUI thread."""
 
-    status = Signal(int, str)             # row, status label
-    detail = Signal(int, str)             # row, progress/error message
-    finished = Signal(int, object)        # row, result dict {files, errors}
+    status = Signal(int, str)             # job ID, status label
+    detail = Signal(int, str)             # job ID, progress/error message
+    finished = Signal(int, object)        # job ID, result dict {files, errors}
 
 
 class ExtractWorker(QRunnable):
@@ -109,7 +109,7 @@ class ExtractWorker(QRunnable):
     `outputs` selects what to produce: any of {"transcript", "audio", "video"}.
     """
 
-    def __init__(self, row: int, url: str, out_dir: str, outputs: set,
+    def __init__(self, job_id: int, url: str, out_dir: str, outputs: set,
                  langs, prefer_manual: bool, transcript_format: str, bitrate: str,
                  translate_to: str | None = None, should_cancel=None,
                  video_height: int = 1080,
@@ -117,7 +117,7 @@ class ExtractWorker(QRunnable):
                  poll_wait_min: float = 0.0,
                  live_capture_minutes: float = 0.0):
         super().__init__()
-        self.row = row
+        self.job_id = job_id
         self.url = url
         self.out_dir = out_dir
         self.outputs = outputs
@@ -139,10 +139,10 @@ class ExtractWorker(QRunnable):
 
     @Slot()
     def run(self):
-        row = self.row
+        job_id = self.job_id
         if self._cancelled():
             return
-        self.signals.status.emit(row, ST_RUNNING)
+        self.signals.status.emit(job_id, ST_RUNNING)
         files, errors = [], []
 
         if "transcript" in self.outputs and not self._cancelled():
@@ -162,7 +162,7 @@ class ExtractWorker(QRunnable):
                         stt_model_size=self.stt_model_size,
                         poll_wait_min=self.poll_wait_min,
                         live_capture_minutes=self.live_capture_minutes,
-                        progress=lambda m: self.signals.detail.emit(row, m),
+                        progress=lambda m: self.signals.detail.emit(job_id, m),
                         should_cancel=self.should_cancel,
                     )
                 else:
@@ -172,7 +172,7 @@ class ExtractWorker(QRunnable):
                         prefer_manual=self.prefer_manual,
                         transcript_format=self.transcript_format,
                         translate_to=self.translate_to,
-                        progress=lambda m: self.signals.detail.emit(row, f"[자막] {m}"),
+                        progress=lambda m: self.signals.detail.emit(job_id, f"[자막] {m}"),
                     )
                 for i, p in enumerate(paths):
                     label = "자막" if i == 0 else f"번역({self.translate_to})"
@@ -186,7 +186,7 @@ class ExtractWorker(QRunnable):
             try:
                 path = extract_audio_mp3(
                     self.url, self.out_dir, bitrate=self.bitrate,
-                    progress=lambda m: self.signals.detail.emit(row, f"[MP3] {m}"),
+                    progress=lambda m: self.signals.detail.emit(job_id, f"[MP3] {m}"),
                     should_cancel=self.should_cancel,
                 )
                 files.append(("MP3", str(path)))
@@ -199,7 +199,7 @@ class ExtractWorker(QRunnable):
             try:
                 path = extract_video(
                     self.url, self.out_dir, height=self.video_height,
-                    progress=lambda m: self.signals.detail.emit(row, f"[영상] {m}"),
+                    progress=lambda m: self.signals.detail.emit(job_id, f"[영상] {m}"),
                     should_cancel=self.should_cancel,
                 )
                 files.append(("MP4", str(path)))
@@ -209,22 +209,23 @@ class ExtractWorker(QRunnable):
                 errors.append(("MP4", f"예기치 못한 오류: {e}"))
 
         if errors and files:
-            self.signals.status.emit(row, ST_PARTIAL)
+            self.signals.status.emit(job_id, ST_PARTIAL)
         elif errors:
-            self.signals.status.emit(row, ST_ERROR)
+            self.signals.status.emit(job_id, ST_ERROR)
         else:
-            self.signals.status.emit(row, ST_DONE)
-        self.signals.finished.emit(row, {"files": files, "errors": errors})
+            self.signals.status.emit(job_id, ST_DONE)
+        self.signals.finished.emit(job_id, {"files": files, "errors": errors})
 
 
 class BuiltinSignals(QObject):
     """Signals for the bundled CPU model worker (download + inference)."""
 
     status = Signal(str)          # high-level phase, e.g. "모델 로딩 중…"
-    progress = Signal(int, int)   # downloaded, total bytes (first-run download)
+    progress = Signal(object, object)   # downloaded, total bytes (first-run download)
     chunk = Signal(int, int)      # current, total chunks (chunked translation)
     token = Signal(str)           # streamed text delta
     done = Signal()
+    cancelled = Signal()
     error = Signal(str)
 
 
@@ -265,6 +266,7 @@ class BuiltinWorker(QRunnable):
                     should_cancel=self._cancel.is_set,
                 )
             if self._cancel.is_set():
+                self.signals.cancelled.emit()
                 return
             # The model is normally preloaded at startup, so this is just
             # inference. Only say "로딩 중" if it actually isn't resident yet
@@ -287,7 +289,10 @@ class BuiltinWorker(QRunnable):
         except Exception as e:  # pragma: no cover - defensive
             self.signals.error.emit(f"예기치 못한 오류: {e}")
             return
-        self.signals.done.emit()
+        if self._cancel.is_set():
+            self.signals.cancelled.emit()
+        else:
+            self.signals.done.emit()
 
     def _run_chunked(self):
         """Translate each chunk as its own request, streamed as one answer.
@@ -498,6 +503,7 @@ class ChatTab(QWidget):
         self._worker: BuiltinWorker | None = None
         self._streaming_assistant: str | None = None
         self._last_error: str | None = None
+        self._translation_path: str | None = None
         # Coalesce stream-driven re-renders (~80 ms) so a fast model doesn't
         # trigger one setHtml() per token.
         self._render_timer = QTimer(self)
@@ -604,6 +610,7 @@ class ChatTab(QWidget):
                                     "현재 답변이 끝난 뒤 보내주세요.")
             return
         panel = self.panel
+        self._translation_path = panel._attached_path if translate_full else None
         # Initial translation (quick button or 'AI로 번역'): translate the
         # transcript body (header metadata excluded) under the strict
         # translation-only prompt, split into chunks so a long video can't
@@ -634,6 +641,7 @@ class ChatTab(QWidget):
         worker.signals.chunk.connect(self._on_chunk)
         worker.signals.token.connect(self._on_token)
         worker.signals.done.connect(self._on_done)
+        worker.signals.cancelled.connect(self._on_cancelled)
         worker.signals.error.connect(self._on_error)
         self._worker = worker
         panel.start_chat_worker(worker)
@@ -674,11 +682,17 @@ class ChatTab(QWidget):
         self._worker = None
         self._set_busy(False)
         self._rerender()
-        if self is self.panel.translate_tab:
-            self.panel._maybe_auto_save_translation()
+        if self._translation_path:
+            self.panel._maybe_auto_save_translation(self._translation_path, answer)
+        self._translation_path = None
+
+    @Slot()
+    def _on_cancelled(self):
+        self._on_error("작업이 취소되었습니다.")
 
     @Slot(str)
     def _on_error(self, msg: str):
+        self._translation_path = None
         self.panel._hide_builtin_ui()
         self._render_timer.stop()
         # Drop the user turn we optimistically recorded so retry isn't doubled.
@@ -839,12 +853,18 @@ class ChatPanel(QWidget):
         """
         target = (self.summary_tab if summarize else
                   self.translate_tab if translate else None)
-        # Don't swap context out from under that tab's in-flight answer.
-        if target is not None and target._worker is not None:
+        changed = self._attached != [(name, text)] or self._attached_path != path
+        # Both tabs share context; never replace it while either is running.
+        if ((changed and any(t._worker is not None for t in
+                            (self.summary_tab, self.translate_tab)))
+                or (target is not None and target._worker is not None)):
             QMessageBox.information(
                 self, "응답 대기 중", "현재 답변이 끝난 뒤 다시 시도하세요."
             )
             return
+        if changed:
+            self.summary_tab.on_reset()
+            self.translate_tab.on_reset()
         self._attached = [(name, text)]
         self._attached_path = path
         self._refresh_context_label()
@@ -867,21 +887,13 @@ class ChatPanel(QWidget):
         self.attach_label.setText(f"📎 컨텍스트: {names}")
         self.attach_label.setStyleSheet("color: #1b7f3b;")
 
-    def _maybe_auto_save_translation(self):
-        """Save the translate tab's last AI response as a .ko.md file if the checkbox is on."""
-        if not self.mw.translate_cb.isChecked():
+    def _maybe_auto_save_translation(self, source_path: str, text: str):
+        """Save only a completed full translation to its original source path."""
+        if not self.mw.translate_cb.isChecked() or not text.strip():
             return
-        if not self._attached_path:
-            return
-        history = self.translate_tab._history
-        assistant_turns = [t["content"] for t in history if t.get("role") == "assistant"]
-        if not assistant_turns:
-            return
-        text = assistant_turns[-1].strip()
-        if not text:
-            return
+        text = text.strip()
         try:
-            src = Path(self._attached_path)
+            src = Path(source_path)
             out_path = src.with_suffix(".ko.md")
             out_path.write_text(text, encoding="utf-8")
             self.mw.statusBar().showMessage(f"번역 저장됨: {out_path.name}", 5000)
@@ -900,12 +912,12 @@ class ChatPanel(QWidget):
             self.dl_bar.setFormat("")
             self.dl_bar.setVisible(True)
 
-    @Slot(int, int)
+    @Slot(object, object)
     def _on_builtin_progress(self, done: int, total: int):
         self.dl_bar.setVisible(True)
         if total > 0:
-            self.dl_bar.setRange(0, total)
-            self.dl_bar.setValue(done)
+            self.dl_bar.setRange(0, 100)
+            self.dl_bar.setValue(min(100, max(0, done * 100 // total)))
             self.dl_bar.setFormat(f"{done / 1e6:.0f} / {total / 1e6:.0f} MB  (%p%)")
         else:
             self.dl_bar.setRange(0, 0)  # indeterminate (unknown size)
@@ -1240,7 +1252,8 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("준비됨")
 
-        self._paths_by_row: dict[int, str] = {}
+        self._paths_by_job: dict[int, list[str]] = {}
+        self._next_job_id = 0
 
     # ------------------------------------------------------------- helpers --
     def _sync_output_controls(self):
@@ -1354,11 +1367,23 @@ class MainWindow(QMainWindow):
     def _add_job_row(self, url: str):
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, COL_TITLE, QTableWidgetItem(url))
+        item = QTableWidgetItem(url)
+        item.setData(Qt.UserRole, self._next_job_id)
+        self._next_job_id += 1
+        self.table.setItem(row, COL_TITLE, item)
         self._set_status_item(row, ST_PENDING)
         self.table.setCellWidget(row, COL_PROGRESS, self._make_progress_bar())
         self.table.setItem(row, COL_DETAIL, QTableWidgetItem(""))
         self.table.setItem(row, COL_FILE, QTableWidgetItem(""))
+
+    def _job_id(self, row: int) -> int:
+        return self.table.item(row, COL_TITLE).data(Qt.UserRole)
+
+    def _job_row(self, job_id: int) -> int | None:
+        for row in range(self.table.rowCount()):
+            if self._job_id(row) == job_id:
+                return row
+        return None
 
     def _row_status(self, row: int) -> str:
         item = self.table.item(row, COL_STATUS)
@@ -1398,6 +1423,7 @@ class MainWindow(QMainWindow):
     def on_clear_done(self):
         for row in range(self.table.rowCount() - 1, -1, -1):
             if self._row_status(row) in (ST_DONE, ST_ERROR):
+                self._paths_by_job.pop(self._job_id(row), None)
                 self.table.removeRow(row)
 
     def on_clear_all(self):
@@ -1405,11 +1431,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "진행 중", "작업이 끝난 뒤 지워주세요.")
             return
         self.table.setRowCount(0)
+        self._paths_by_job.clear()
         self.progress.setValue(0)
         self.progress.setMaximum(0)
 
     def on_row_double_clicked(self, row: int, _col: int):
-        paths = self._paths_by_row.get(row) or []
+        paths = self._paths_by_job.get(self._job_id(row)) or []
         for path in paths:
             if path and Path(path).exists():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -1418,13 +1445,13 @@ class MainWindow(QMainWindow):
     def _selected_transcript_path(self):
         """The .md transcript to summarize: the selected row's, else newest."""
         selected = [i.row() for i in self.table.selectionModel().selectedRows()]
-        order = selected + sorted(self._paths_by_row, reverse=True)
+        order = selected + list(range(self.table.rowCount() - 1, -1, -1))
         seen = set()
         for row in order:
             if row in seen:
                 continue
             seen.add(row)
-            for p in self._paths_by_row.get(row, []):
+            for p in self._paths_by_job.get(self._job_id(row), []):
                 if p.lower().endswith(".md") and Path(p).exists():
                     return p
         return None
@@ -1547,7 +1574,7 @@ class MainWindow(QMainWindow):
         for row in pending:
             url = self.table.item(row, COL_TITLE).text()
             worker = ExtractWorker(
-                row, url, self.out_dir, outputs,
+                self._job_id(row), url, self.out_dir, outputs,
                 langs, prefer_manual, transcript_format, bitrate,
                 translate_to=translate_to,
                 should_cancel=self._shutdown.is_set,
@@ -1563,11 +1590,16 @@ class MainWindow(QMainWindow):
             self.pool.start(worker)
 
     @Slot(int, str)
-    def _on_worker_status(self, row: int, status: str):
-        self._set_status_item(row, status)
+    def _on_worker_status(self, job_id: int, status: str):
+        row = self._job_row(job_id)
+        if row is not None:
+            self._set_status_item(row, status)
 
     @Slot(int, str)
-    def _on_worker_detail(self, row: int, msg: str):
+    def _on_worker_detail(self, job_id: int, msg: str):
+        row = self._job_row(job_id)
+        if row is None:
+            return
         self.table.setItem(row, COL_DETAIL, QTableWidgetItem(msg))
         self._update_row_progress(row, msg)
 
@@ -1592,13 +1624,14 @@ class MainWindow(QMainWindow):
             bar.setValue(100)
 
     @Slot(int, object)
-    def _on_worker_finished(self, row: int, result: dict):
+    def _on_worker_finished(self, job_id: int, result: dict):
+        row = self._job_row(job_id)
         files = result.get("files", [])
         errors = result.get("errors", [])
 
-        if files:
+        if files and row is not None:
             # Remember paths for double-click (open the first produced file).
-            self._paths_by_row[row] = [p for _label, p in files]
+            self._paths_by_job[job_id] = [p for _label, p in files]
             names = "  |  ".join(f"{lbl}: {Path(p).name}" for lbl, p in files)
             item = QTableWidgetItem(names)
             item.setToolTip(
@@ -1610,7 +1643,8 @@ class MainWindow(QMainWindow):
             detail = "  /  ".join(f"[{lbl}] {msg}" for lbl, msg in errors)
         else:
             detail = "저장 완료"
-        self.table.setItem(row, COL_DETAIL, QTableWidgetItem(detail))
+        if row is not None:
+            self.table.setItem(row, COL_DETAIL, QTableWidgetItem(detail))
 
         self._completed += 1
         self.progress.setValue(self._completed)

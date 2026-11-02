@@ -28,7 +28,7 @@ design_handoff_lime_forward/
 
 .zcode/
 
-tests/
+.pytest_cache/
 
 *.log
 

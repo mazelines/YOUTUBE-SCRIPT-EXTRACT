@@ -56,6 +56,7 @@ _models_lock = threading.Lock()
 # the slow step, so this effectively caps STT throughput at 1 regardless of
 # concurrency — but it's correct.
 _transcribe_lock = threading.Lock()
+_download_locks = {size: threading.Lock() for size in STT_MODEL_SIZES}
 
 
 def _data_dir() -> Path:
@@ -119,6 +120,23 @@ def download_model(size: str = DEFAULT_STT_MODEL,
     ``on_progress(done_bytes, total_bytes)`` is called as data arrives.
     Raises STTError on any failure.
     """
+    if size not in _download_locks:
+        raise STTError(f"지원하지 않는 STT 모델: {size}")
+    lock = _download_locks[size]
+    while not lock.acquire(timeout=0.1):
+        if should_cancel and should_cancel():
+            raise STTError("다운로드가 취소되었습니다.")
+    try:
+        if should_cancel and should_cancel():
+            raise STTError("다운로드가 취소되었습니다.")
+        if not is_model_present(size):
+            _download_model_file(size, on_progress, should_cancel)
+    finally:
+        lock.release()
+
+
+def _download_model_file(size, on_progress, should_cancel):
+    """Called with the model's download lock held, through atomic publication."""
     dest = model_path(size)
     tmp = dest.with_suffix(dest.suffix + ".part")
     url = _model_url(size)

@@ -99,12 +99,16 @@ Python 3.10 이상 필요.
 
 ## 릴리스 빌드 (Windows 실행파일)
 
-PyInstaller로 폴더 형태 빌드를 만든 뒤 ZIP으로 배포합니다.
+릴리스는 로컬 빌드 → EXE 자체 검사 → ZIP 생성으로 끝납니다. Google Drive 등 클라우드 업로드는 포함하지 않습니다.
 
-```bash
-pip install pyinstaller
-pyinstaller --noconfirm --clean YouTubeTranscriptExtractor.spec
-# 결과: dist/YouTubeTranscriptExtractor/ 폴더
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install pyinstaller
+.\scripts\release.ps1
+# 결과: dist/YouTubeTranscriptExtractor/ 폴더 및 dist/YouTubeTranscriptExtractor.zip
+
+.\scripts\release.ps1 -SkipBuild  # 기존 빌드 자체 검사 후 ZIP 생성
+.\scripts\release.ps1 -Versioned  # dist/에 날짜별 ZIP도 추가 생성
 ```
 
 빌드 검증:
@@ -112,7 +116,9 @@ pyinstaller --noconfirm --clean YouTubeTranscriptExtractor.spec
 dist\YouTubeTranscriptExtractor\YouTubeTranscriptExtractor.exe --selftest
 ```
 
-## 배포 (FTP)
+## 별도 수동 FTP 업로드
+
+기존 FTP 도구는 기본 릴리스 절차에 포함하지 않으며, 명시적으로 업로드할 때만 실행합니다.
 
 `ftp-config.example.json`을 복사해 `ftp-config.json`을 만들고 비밀번호를 채운 뒤:
 

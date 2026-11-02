@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import tempfile
 import datetime as _dt
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -897,7 +898,7 @@ def _capture_live_audio(*, ydl_module, video_id, out_dir, capture_minutes,
         "-t", duration_sec,
         "-vn", "-acodec", "libmp3lame", "-b:a", f"{STT_AUDIO_BITRATE}k",
         "-rtbufsize", "64M",   # live buffer; avoids "real-time buffer too full"
-        str(part_path),
+        "-f", "mp3", str(part_path),
     ]
 
     report(f"라이브 캡처 중… ({capture_minutes:.0f}분, ffmpeg 직접 녹음)")
@@ -1064,7 +1065,6 @@ def extract_to_markdown_with_fallback(
         )
 
     # Step 3: STT fallback.
-    audio_tmp: Path | None = None
     if result is None and stt_fallback:
         if should_cancel and should_cancel():
             raise ExtractionError("작업이 취소되었습니다.")
@@ -1118,9 +1118,11 @@ def extract_to_markdown_with_fallback(
         report("[STT] 음성 다운로드 중…")
         audio_path: Path | None = None
         stt_result = None
+        # Own the complete temporary directory, including failed download shards.
+        audio_tmp = tempfile.TemporaryDirectory(prefix="yt-stt-")
         try:
             audio_path = _download_for_stt(
-                url_or_id, out_dir,
+                url_or_id, audio_tmp.name,
                 live_capture_minutes=live_capture_minutes,
                 progress=lambda m: report(f"[STT] {m}"),
                 should_cancel=should_cancel,
@@ -1143,16 +1145,23 @@ def extract_to_markdown_with_fallback(
                 progress=lambda m: report(f"[STT] {m}"),
                 should_cancel=should_cancel,
             )
+            if keep_audio and audio_path is not None:
+                # Preserve an explicitly requested copy without replacing user files.
+                import shutil
+                out = Path(out_dir)
+                out.mkdir(parents=True, exist_ok=True)
+                dest = out / audio_path.name
+                index = 1
+                while True:
+                    try:
+                        with dest.open("xb") as target, audio_path.open("rb") as source:
+                            shutil.copyfileobj(source, target)
+                        break
+                    except FileExistsError:
+                        dest = out / f"{audio_path.stem}.stt-{index}{audio_path.suffix}"
+                        index += 1
         finally:
-            # Clean up the intermediate audio unless the user wants it kept.
-            # Doing this in `finally` guarantees the temp mp3 doesn't linger
-            # in out_dir even if STT raised — previously the unlink lived
-            # after the _run_stt call, so an exception would leak the file.
-            if audio_path is not None and not keep_audio:
-                try:
-                    audio_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            audio_tmp.cleanup()
 
         if stt_result is None:
             raise ExtractionError(
