@@ -76,7 +76,7 @@ if (-not $SkipSelftest) {
     $selftestOut = Join-Path $projectRoot '_selftest_release.txt'
     if (Test-Path $selftestOut) { Remove-Item $selftestOut }
     $env:SELFTEST_OUT = $selftestOut
-    Start-Process -FilePath $exePath -ArgumentList '--selftest' -WindowStyle Hidden -Wait
+    Start-Process -FilePath $exePath -ArgumentList '--selftest','--require-gpu-backend' -WindowStyle Hidden -Wait
     Remove-Item Env:\SELFTEST_OUT
     if (-not (Test-Path $selftestOut)) {
         Write-Fail 'Selftest produced no result file'

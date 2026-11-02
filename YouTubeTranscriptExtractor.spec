@@ -16,6 +16,7 @@ from PyInstaller.utils.hooks import (
 )
 from pathlib import Path
 import shutil
+import os
 import subprocess
 from urllib.request import urlopen
 
@@ -52,7 +53,13 @@ hiddenimports += collect_submodules("pygments")
 # Built-in CPU LLM: bundle llama-cpp-python's compiled library + data, but only
 # if it's installed (keeps builds working on clones without the optional dep).
 # The GGUF model is NOT bundled — it's downloaded from Hugging Face on first use.
-binaries = [(node, "node")]
+# Bundle the redistributable loader too, so the CPU fallback can start on
+# Windows machines that do not have a Vulkan-capable display driver installed.
+vulkan_loader = Path(os.environ["SystemRoot"]) / "System32" / "vulkan-1.dll"
+if not vulkan_loader.is_file():
+    raise RuntimeError("Vulkan loader missing on build host; install the Vulkan runtime.")
+binaries = [(node, "node"), (str(vulkan_loader), ".")]
+datas += [("licenses/Vulkan-Loader.txt", "licenses")]
 try:
     binaries += collect_dynamic_libs("llama_cpp")
     datas += collect_data_files("llama_cpp")
