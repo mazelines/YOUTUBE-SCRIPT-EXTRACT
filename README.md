@@ -1,6 +1,6 @@
 # YouTube 자막 추출기 (YouTube Transcript Extractor)
 
-[![Version 1.2.0](https://img.shields.io/badge/version-1.2.0-3264da)](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.2.0)
+[![Version 1.2.1](https://img.shields.io/badge/version-1.2.1-3264da)](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.2.1)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![PySide6 / Qt 6](https://img.shields.io/badge/GUI-PySide6%20%2F%20Qt%206-41CD52)
@@ -9,7 +9,7 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 
 ![YouTube 자막 추출기 — 영상 추가, 작업 목록, 결과 확인으로 구성한 새 UI](docs/screenshot.png)
 
-*버전 1.2.0의 UI 개편 화면을 Windows에서 직접 캡처했습니다.*
+*Windows에서 직접 캡처한 실행 화면입니다.*
 
 ## 개발 언어 및 기술 구성
 
@@ -48,10 +48,22 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 - **요약 탭** — 자막 핵심 내용을 한국어로 요약
 - **번역 탭** — 자막 전체를 한국어로 번역, 완료 시 자동으로 `.ko.md` 파일로 저장 (체크박스 옵션)
 - **기본 제공자** — 앱 내장 모델(**Gemma 4 E4B**, Apache-2.0), 첫 사용 시 Hugging Face에서 자동 다운로드(약 5.3GB), 이후 오프라인 동작
-- **GPU 가속** — NVIDIA·AMD·Intel GPU 감지 시 Vulkan으로 자동 가속 (CPU 대비 ~10~20배), 없으면 CPU 동작
+- **GPU 가속** — 1.2.1부터 Vulkan 지원 엔진을 동봉합니다. 실제 GPU 배치가 확인되면 장치 이름과 GPU 레이어 수를 표시하고, GPU를 사용할 수 없으면 CPU 실행 사유를 표시합니다. 1.2.0의 요약·번역 엔진은 CPU 전용이었습니다.
 - **내장 모델 사용** — 현재 앱 UI는 별도 API 키 없이 내장 모델로 동작
 
 ### llama-cpp-python 설치 (내장 모델 사용 시)
+
+**GPU 개발 환경**: 일반 `pip install -r requirements-ai.txt`만으로는 GPU 지원이 보장되지 않습니다. [공식 설치 안내](https://github.com/abetlen/llama-cpp-python#installation)의 Vulkan 빌드 옵션을 사용해야 합니다. Visual Studio x64 C++ 도구와 LunarG Vulkan SDK가 설치된 PowerShell에서 아래 스크립트로 고정 버전의 GPU 휠을 빌드한 뒤 설치하세요.
+
+```powershell
+./scripts/build-gpu-engine.ps1 -Python .venv/Scripts/python.exe -VulkanSdk 'C:/VulkanSDK/<설치 버전>'
+.venv/Scripts/python.exe -m pip install --force-reinstall --no-deps .zcode/gpu-wheels/llama_cpp_python-0.3.34-py3-none-win_amd64.whl
+.venv/Scripts/python.exe run.py --gpu-selftest
+```
+
+`--gpu-selftest`는 이미 다운로드된 모델로 실제 추론을 수행하고, 모든 레이어의 GPU 배치와 출력 생성을 확인합니다. `GPU_SELFTEST_OUT` 환경변수로 JSON 결과 경로를 지정할 수 있습니다. 실행 장치 진단은 모델 캐시 폴더의 `model-runtime.json`에도 기록됩니다. `YT_EXTRACTOR_FORCE_CPU=1`로 CPU 실행을 명시할 수 있습니다.
+
+릴리스 스크립트는 EXE에 Vulkan 백엔드가 없으면 패키징을 중단합니다. GPU가 없는 컴퓨터에서는 동봉된 CPU 백엔드로 실행할 수 있습니다.
 
 > **Windows Long Path 필수**: llama-cpp-python이 vendoring하는 `llama.cpp` 트리에 260자를 넘는 Svelte 경로가 있어, 기본 Windows에서는 `OSError: [Errno 2] No such file or directory: ...ChatAttachmentsListItemMcpPrompt.svelte`로 설치가 실패합니다. 동봉된 **`enable_long_paths.bat`**을 한 번 실행(관리자 권한, UAC 승인)하면 시스템 전체에 long path가 활성화되어 재부팅 없이 해결됩니다. Python 3.6+ 인스톨러는 이미 `longPathAware` 매니페스트를 포함하므로 레지스트리만 켜면 pip이 자동으로 긴 경로를 처리합니다.
 
