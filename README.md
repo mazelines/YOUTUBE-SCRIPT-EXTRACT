@@ -1,6 +1,6 @@
 # YouTube 자막 추출기 (YouTube Transcript Extractor)
 
-[![Version 1.1.4](https://img.shields.io/badge/version-1.1.4-cde86a)](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.1.4)
+[![Version 1.2.0](https://img.shields.io/badge/version-1.2.0-3264da)](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.2.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![PySide6 / Qt 6](https://img.shields.io/badge/GUI-PySide6%20%2F%20Qt%206-41CD52)
@@ -9,7 +9,7 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 
 ![YouTube 자막 추출기 — 영상 추가, 작업 목록, 결과 확인으로 구성한 새 UI](docs/screenshot.png)
 
-*현재 소스의 UI 개편 화면을 Windows에서 직접 캡처했습니다. 공개된 1.1.4 릴리스에는 이 UI 개편이 아직 포함되어 있지 않습니다.*
+*버전 1.2.0의 UI 개편 화면을 Windows에서 직접 캡처했습니다.*
 
 ## 개발 언어 및 기술 구성
 
