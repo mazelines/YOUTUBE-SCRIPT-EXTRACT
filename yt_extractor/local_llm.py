@@ -1,4 +1,4 @@
-"""Built-in local LLM: a small GGUF model run on CPU via llama-cpp-python.
+"""Built-in GGUF model with verified GPU placement and explicit CPU fallback.
 
 The model is downloaded from Hugging Face on first use and cached under the
 user's app-data dir, so the shipped app stays small and needs no manual setup.
@@ -9,11 +9,15 @@ the app launches fine even where that optional dependency isn't installed yet.
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import requests
 
 from .llm import LLMError
+from .gpu_runtime import (
+    begin_attempt, install_log_capture, mark_loaded, runtime_info, runtime_summary,
+)
 
 # Gemma 4 E4B Instruct, Q4_K_M quant (~5.3 GB, needs ~6 GB RAM). The earlier
 # 0.5B model was too weak — it echoed transcripts instead of summarizing — so we
@@ -101,6 +105,7 @@ def _get_llm():
     if _llm is not None:
         return _llm
     try:
+        import llama_cpp
         from llama_cpp import Llama
     except ImportError:
         raise LLMError(
@@ -110,6 +115,10 @@ def _get_llm():
         )
     if not is_model_present():
         raise LLMError("모델 파일이 없습니다. 먼저 다운로드가 필요합니다.")
+    install_log_capture(llama_cpp)
+    llama_cpp.llama_backend_init()
+    gpu_available = bool(llama_cpp.llama_supports_gpu_offload())
+    force_cpu = os.environ.get("YT_EXTRACTOR_FORCE_CPU", "") == "1"
     # 16k context holds a Korean transcript (~1 char ≈ 1 token, so
     # MAX_CONTEXT_CHARS=12000 ≈ 12k tokens) plus room for the answer.
     # chat_format is left unset so llama-cpp-python uses the chat template
@@ -121,14 +130,26 @@ def _get_llm():
         n_threads=max(1, (os.cpu_count() or 4) - 1),
         verbose=False,
     )
-    # Use the GPU when one is available (offload all layers), else CPU.
-    # A CUDA-enabled build with no GPU still loads and just runs on CPU; the
-    # try/except additionally catches the small-GPU out-of-memory case and
-    # retries on CPU. Same single build covers GPU and CPU (Ollama-style).
-    try:
-        _llm = Llama(**common, n_gpu_layers=-1)
-    except Exception:
+    # Capture the native offload report even with verbose=False. A request to
+    # offload is not proof that the engine actually assigned layers to a GPU.
+    if gpu_available and not force_cpu:
+        begin_attempt()
+        try:
+            _llm = Llama(**common, n_gpu_layers=-1)
+        except Exception as error:
+            begin_attempt(f"GPU 초기화 실패 후 CPU로 전환: {str(error).splitlines()[0]}")
+            _llm = Llama(**common, n_gpu_layers=0)
+    else:
+        begin_attempt("CPU 실행을 지정했습니다." if force_cpu else
+                      "사용 가능한 GPU 또는 GPU 지원 엔진이 없습니다.")
         _llm = Llama(**common, n_gpu_layers=0)
+    mark_loaded()
+    # Preserve a concise diagnostic even in the windowed EXE (no console).
+    try:
+        (_data_dir() / "model-runtime.json").write_text(
+            json.dumps(runtime_info(), ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
     return _llm
 
 
@@ -161,7 +182,7 @@ def ensure_loaded(*, on_status=None, on_progress=None, should_cancel=None):
     if should_cancel and should_cancel():
         return
     if on_status:
-        on_status("내장 모델 워밍업 중…")
+        on_status(f"{runtime_summary()} · 워밍업 중…")
     _warmup()
 
 

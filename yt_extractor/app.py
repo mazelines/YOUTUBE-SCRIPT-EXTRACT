@@ -50,6 +50,7 @@ from .local_llm import (
 from .chat_render import render_conversation
 from .theme import repolish
 from .ui_layout import TONE_ROLE
+from .gpu_runtime import runtime_summary
 
 
 # Columns of the job table.
@@ -293,7 +294,7 @@ class BuiltinWorker(QRunnable):
             # inference. Only say "로딩 중" if it actually isn't resident yet
             # (e.g. preload hasn't finished) — otherwise it looks like a reload.
             if is_loaded():
-                self.signals.status.emit("AI가 처리 중…")
+                self.signals.status.emit(f"{runtime_summary()} · 처리 중…")
             else:
                 self.signals.status.emit("모델 로딩 중… (최초 1회는 시간이 걸립니다)")
             if self.chunks is not None:
@@ -909,7 +910,8 @@ class ChatPanel(QWidget):
             self.dl_bar.setRange(0, 0)  # indeterminate (unknown size)
 
     def _hide_builtin_ui(self):
-        self.builtin_status.setVisible(False)
+        self.builtin_status.setVisible(is_loaded())
+        self.builtin_status.setText(runtime_summary())
         self.dl_bar.setVisible(False)
 
     def start_chat_worker(self, worker: BuiltinWorker):
@@ -937,7 +939,7 @@ class ChatPanel(QWidget):
         self._preload_worker = None
         self.dl_bar.setVisible(False)
         self.builtin_status.setVisible(True)
-        self.builtin_status.setText("내장 모델 준비 완료")
+        self.builtin_status.setText(runtime_summary())
 
     @Slot(str)
     def _on_preload_error(self, msg: str):
@@ -1860,8 +1862,14 @@ def _run_selftest() -> int:
     try:
         import llama_cpp  # noqa: F401
         llama_status = f"llama_cpp {getattr(llama_cpp, '__version__', '?')}"
+        backend = Path(llama_cpp.__file__).parent / "lib" / "ggml-vulkan.dll"
+        llama_status += f" | Vulkan backend {'bundled' if backend.is_file() else 'absent'}"
+        if "--require-gpu-backend" in sys.argv and not backend.is_file():
+            problems.append("Vulkan backend missing: build the GPU engine before packaging")
     except Exception as e:
         llama_status = f"llama_cpp absent ({e.__class__.__name__})"
+        if "--require-gpu-backend" in sys.argv:
+            problems.append(llama_status)
 
     # STT fallback engine is likewise optional. Report presence/absence for
     # build verification, but never fail the selftest over it.
@@ -1930,6 +1938,9 @@ def _run_screenshot(path: str) -> int:
 
 
 def main():
+    if "--gpu-selftest" in sys.argv:
+        from .gpu_selftest import run
+        sys.exit(run())
     if "--selftest" in sys.argv:
         sys.exit(_run_selftest())
     if "--screenshot" in sys.argv:
