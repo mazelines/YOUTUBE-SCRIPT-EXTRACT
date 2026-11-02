@@ -49,16 +49,16 @@ def _md_to_html(text: str) -> str:
 # ``.turn`` classes so they don't fight QTextDocument's defaults elsewhere.
 _DOC_STYLE = """
 <style>
-  body { font-family: 'Gothic A1', 'Apple SD Gothic Neo', 'Malgun Gothic', system-ui, sans-serif;
-         font-size: 13.5px; color: #2a2622; background: #efe8da; }
+  body { font-family: 'Malgun Gothic', 'Segoe UI', sans-serif;
+         font-size: 13px; color: #24334b; background: #f8fafc; }
   .turn { padding: 10px 14px; margin: 8px 0; border-radius: 16px; }
-  .turn-user { background: #2a2622; color: #ffffff; margin-left: 40px; }
-  .turn-ai   { background: transparent; color: #1a1410; margin-right: 40px; }
-  .turn-err  { background: #fde6de; border-left: 3px solid #e85d3e; color: #7a0014; }
+  .turn-user { background: #eaf0ff; color: #24334b; margin-left: 16px; }
+  .turn-ai   { background: transparent; color: #24334b; margin-right: 8px; }
+  .turn-err  { background: #fff0f1; border-left: 3px solid #c23e48; color: #922c36; }
   .role      { font-weight: bold; margin-bottom: 4px; font-size: 11px; letter-spacing: 0.04em; }
-  .role-user { color: #b6b0a0; }
-  .role-ai   { color: #7f8a3f; }
-  .role-err  { color: #e85d3e; }
+  .role-user { color: #64748b; }
+  .role-ai   { color: #3264da; }
+  .role-err  { color: #c23e48; }
   .body      { line-height: 1.62; }
   .body p    { margin: 4px 0; }
   .body h1, .body h2, .body h3, .body h4 { margin: 10px 0 4px; }
@@ -68,16 +68,16 @@ _DOC_STYLE = """
   .body ul, .body ol { margin: 4px 0 4px 20px; }
   .body li   { margin: 2px 0; }
   .body blockquote { margin: 6px 0; padding: 4px 10px;
-                     background: #f6f2ea; border-left: 3px solid #b3cf4e; color: #575451; }
-  .body code { background: #ece5d8; padding: 0 3px;
+                     background: #eef3fc; border-left: 3px solid #3264da; color: #475569; }
+  .body code { background: #e8eef7; padding: 0 3px;
                font-family: 'JetBrains Mono', 'Consolas', 'Menlo', monospace; font-size: 12.5px; }
   .body pre  { background: #1e1e1e; color: #dcdcdc; padding: 10px; border-radius: 8px;
                font-family: 'JetBrains Mono', 'Consolas', 'Menlo', monospace; }
   .body pre code { background: transparent; padding: 0; }
   .body table { border-collapse: collapse; margin: 6px 0; }
-  .body th, .body td { border: 1px solid #ece5d8; padding: 4px 8px; }
-  .body th   { background: #f6f2ea; }
-  .cursor    { color: #f47458; }
+  .body th, .body td { border: 1px solid #dfe5ee; padding: 4px 8px; }
+  .body th   { background: #eef3fc; }
+  .cursor    { color: #3264da; }
 </style>
 """
 

@@ -20,12 +20,11 @@ from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl, QTimer,
     QStandardPaths,
 )
-from PySide6.QtGui import QDesktopServices, QBrush, QColor, QPixmap
+from PySide6.QtGui import QDesktopServices, QBrush, QColor
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPlainTextEdit, QPushButton, QLabel, QLineEdit, QCheckBox, QSpinBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QProgressBar,
-    QGroupBox, QAbstractItemView, QMessageBox, QComboBox, QFrame, QSplitter,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPlainTextEdit, QPushButton, QLabel,
+    QTableWidgetItem, QFileDialog, QProgressBar, QMessageBox, QFrame,
     QTextBrowser, QTabWidget,
 )
 
@@ -65,11 +64,11 @@ ST_PARTIAL = "부분 완료"
 ST_ERROR = "실패"
 
 _STATUS_COLORS = {
-    ST_PENDING: "#8a836f",
-    ST_RUNNING: "#b3cf4e",
-    ST_DONE: "#7f8a3f",
+    ST_PENDING: "#64748b",
+    ST_RUNNING: "#3264da",
+    ST_DONE: "#16805d",
     ST_PARTIAL: "#b07000",
-    ST_ERROR: "#e85d3e",
+    ST_ERROR: "#c23e48",
 }
 
 
@@ -425,60 +424,23 @@ def _banner_image_path():
 
 
 class BannerWidget(QFrame):
-    """Clickable MazeLine ad banner — Lime Forward B theme, pinned at the bottom."""
+    """Compact brand footer with a keyboard-accessible website link."""
 
-    def __init__(self, url: str = BANNER_URL, image_path=None,
-                 max_height: int = 110):
+    def __init__(self, url: str = BANNER_URL, image_path=None, max_height=32):
         super().__init__()
         self.url = url
-        self._pix = None  # kept for selftest compatibility
-        self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip(f"{url} 바로가기")
-        self.setFixedHeight(64)
-        self.setStyleSheet(
-            "BannerWidget { background-color: #cde86a; border-radius: 0px; }"
-        )
-
+        self._pix = None
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(28, 0, 28, 0)
-        lay.setSpacing(0)
-
-        brand = QLabel("MazeLine")
-        brand.setStyleSheet(
-            "font-size: 15px; font-weight: 800; color: #2a2622; background: transparent;"
-        )
+        lay.setContentsMargins(0, 0, 0, 0)
+        brand = QLabel("MazeLine  ·  영상에서 지식으로")
+        brand.setObjectName("muted")
         lay.addWidget(brand)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.VLine)
-        sep.setFixedHeight(18)
-        sep.setStyleSheet(
-            "QFrame { color: rgba(42,38,34,80); background: transparent; }"
-        )
-        lay.addSpacing(14)
-        lay.addWidget(sep)
-        lay.addSpacing(14)
-
-        tagline = QLabel("게임 개발의 새로운 기준")
-        tagline.setStyleSheet(
-            "font-size: 13px; color: #575451; background: transparent;"
-        )
-        lay.addWidget(tagline)
-
-        lay.addStretch(1)
-
-        link = QLabel("www.mazeline.tech ↗")
-        link.setStyleSheet(
-            "font-size: 13px; font-weight: 700; color: #f47458;"
-            "font-family: 'JetBrains Mono', 'Consolas', monospace;"
-            "background: transparent;"
-        )
-        lay.addWidget(link)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            QDesktopServices.openUrl(QUrl(self.url))
-        super().mousePressEvent(event)
+        lay.addStretch()
+        self.link = QPushButton("www.mazeline.tech ↗")
+        self.link.setFlat(True)
+        self.link.setCursor(Qt.PointingHandCursor)
+        self.link.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.url)))
+        lay.addWidget(self.link)
 
 
 SUMMARY_PROMPT = "첨부된 자막을 핵심 위주로 한국어로 요약해 주세요."
@@ -544,7 +506,7 @@ class ChatTab(QWidget):
         # Force a light canvas regardless of system palette — chat bubbles are
         # tuned for a light page.
         self.view.setStyleSheet(
-            "QTextBrowser { background-color: #f6f6f6; color: #222222; }"
+            "QTextBrowser { background-color: #f8fafc; color: #24334b; }"
         )
         self.view.setPlaceholderText(placeholder)
         lay.addWidget(self.view, stretch=1)
@@ -564,7 +526,7 @@ class ChatTab(QWidget):
 
         send_row = QHBoxLayout()
         self.send_btn = QPushButton("질문하기")
-        self.send_btn.setStyleSheet("font-weight: bold;")
+        self.send_btn.setObjectName("primary")
         self.send_btn.clicked.connect(self.on_send_clicked)
         send_row.addWidget(self.send_btn)
         self.stop_btn = QPushButton("중지")
@@ -590,8 +552,8 @@ class ChatTab(QWidget):
         if not self.panel._attached:
             QMessageBox.information(
                 self, "자막 없음",
-                "먼저 왼쪽 목록에서 자막 항목을 선택하고 'AI로 요약' 또는 "
-                "'AI로 번역'을 눌러 불러오세요.",
+                "먼저 왼쪽 목록에서 자막 항목을 선택하고 'AI 요약' 또는 "
+                "'AI 번역'을 눌러 불러오세요.",
             )
             return
         self._send(self.quick_prompt,
@@ -614,7 +576,7 @@ class ChatTab(QWidget):
             return
         panel = self.panel
         self._translation_path = panel._attached_path if translate_full else None
-        # Initial translation (quick button or 'AI로 번역'): translate the
+        # Initial translation (quick button or 'AI 번역'): translate the
         # transcript body (header metadata excluded) under the strict
         # translation-only prompt, split into chunks so a long video can't
         # overflow the model's n_ctx and get truncated. Results stream back as
@@ -781,24 +743,17 @@ class ChatPanel(QWidget):
 
     def _build(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 0, 0, 0)
+        lay.setContentsMargins(14, 14, 14, 14)
 
-        title = QLabel("🤖 AI 채팅 — 자막 요약 · 번역 · Q&A")
-        title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self.setMinimumWidth(360)
+        title = QLabel("자막을 더 깊이 읽는 공간")
+        title.setObjectName("sectionTitle")
         lay.addWidget(title)
-
-        # --- Built-in model info (the only supported provider) ---
-        cfg = QGroupBox("AI 모델")
-        cfg_lay = QVBoxLayout(cfg)
-        cfg_lay.setContentsMargins(8, 6, 8, 6)
-        info = QLabel(
-            "앱 내장 모델을 사용합니다. GPU(NVIDIA·AMD·Intel)가 있으면 자동 "
-            "가속, 없으면 CPU로 동작합니다. 설정이 필요 없습니다."
-        )
+        info = QLabel("내장 AI로 요약하고, 번역하고, 질문하세요.")
+        info.setObjectName("muted")
         info.setWordWrap(True)
-        info.setStyleSheet("color: #7a7a7a; font-size: 11px;")
-        cfg_lay.addWidget(info)
-        lay.addWidget(cfg)
+        info.setToolTip("첫 사용 시 모델을 다운로드합니다. GPU가 있으면 자동 가속하며, 없으면 CPU를 사용합니다.")
+        lay.addWidget(info)
 
         # --- Context indicator ---
         # Transcripts enter the conversation via the left pane's "AI로 요약" /
@@ -806,11 +761,11 @@ class ChatPanel(QWidget):
         # — so there's no manual file-picking here. This label just shows what's
         # loaded; it's shared between tabs since both operate on the same .md.
         self.attach_label = QLabel(
-            "컨텍스트 없음 — 왼쪽에서 자막을 추출한 뒤 'AI로 요약' 또는 "
-            "'AI로 번역'을 누르세요"
+            "작업 결과에서 AI 요약 또는 AI 번역을 선택하세요."
         )
         self.attach_label.setStyleSheet("color: #7a7a7a;")
         self.attach_label.setWordWrap(True)
+        self.attach_label.setTextFormat(Qt.PlainText)
         lay.addWidget(self.attach_label)
 
         # First-run model download / load indicator (hidden until needed) —
@@ -827,21 +782,21 @@ class ChatPanel(QWidget):
         # --- Tabs: separate conversations for summary vs translation ---
         self.tabs = QTabWidget()
         self.summary_tab = ChatTab(
-            self, "📝 자막 요약 시작", SUMMARY_PROMPT,
+            self, "자막 요약 시작", SUMMARY_PROMPT,
             placeholder=(
-                "왼쪽에서 자막을 추출해 'AI로 요약'을 누르거나, "
+                "왼쪽에서 자막을 추출해 'AI 요약'을 누르거나, "
                 "여기에 질문을 입력하세요."
             ),
         )
         self.translate_tab = ChatTab(
-            self, "🌐 자막 번역 시작", TRANSLATE_PROMPT,
+            self, "자막 번역 시작", TRANSLATE_PROMPT,
             placeholder=(
-                "왼쪽에서 자막을 추출해 'AI로 번역'을 누르세요. "
+                "왼쪽에서 자막을 추출해 'AI 번역'을 누르세요. "
                 "번역 결과에 대한 추가 질문은 여기에 입력하세요."
             ),
         )
-        self.tabs.addTab(self.summary_tab, "📝 요약")
-        self.tabs.addTab(self.translate_tab, "🌐 번역")
+        self.tabs.addTab(self.summary_tab, "요약")
+        self.tabs.addTab(self.translate_tab, "번역")
         lay.addWidget(self.tabs, stretch=1)
 
     # ----------------------------------------------------------- context ---
@@ -881,13 +836,12 @@ class ChatPanel(QWidget):
     def _refresh_context_label(self):
         if not self._attached:
             self.attach_label.setText(
-                "컨텍스트 없음 — 왼쪽에서 자막을 추출한 뒤 'AI로 요약' 또는 "
-                "'AI로 번역'을 누르세요"
+                "작업 결과에서 AI 요약 또는 AI 번역을 선택하세요."
             )
             self.attach_label.setStyleSheet("color: #7a7a7a;")
             return
         names = ", ".join(n for n, _ in self._attached)
-        self.attach_label.setText(f"📎 컨텍스트: {names}")
+        self.attach_label.setText(f"분석 중인 자막: {names}")
         self.attach_label.setStyleSheet("color: #1b7f3b;")
 
     def _maybe_auto_save_translation(self, source_path: str, text: str):
@@ -899,6 +853,7 @@ class ChatPanel(QWidget):
             src = Path(source_path)
             out_path = src.with_suffix(".ko.md")
             out_path.write_text(text, encoding="utf-8")
+            self.mw._register_translation_output(source_path, str(out_path))
             self.mw.statusBar().showMessage(f"번역 저장됨: {out_path.name}", 5000)
         except OSError as e:
             self.mw.statusBar().showMessage(f"번역 저장 실패: {e}", 5000)
@@ -954,7 +909,7 @@ class ChatPanel(QWidget):
         self._preload_worker = None
         self.dl_bar.setVisible(False)
         self.builtin_status.setVisible(True)
-        self.builtin_status.setText("✅ 내장 모델 준비 완료")
+        self.builtin_status.setText("내장 모델 준비 완료")
 
     @Slot(str)
     def _on_preload_error(self, msg: str):
@@ -982,7 +937,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("YouTube 자막 추출기")
-        self.resize(1200, 980)
+        self.resize(1180, 860)
+        self.setMinimumSize(680, 440)
 
         self.pool = QThreadPool.globalInstance()
         self.out_dir = _default_output_dir()
@@ -998,278 +954,139 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._probe_stt_async()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_initial_size_applied", False):
+            self._initial_size_applied = True
+            # Windows can change the scale factor when the native window is
+            # first created. Fit logical dimensions after that transition.
+            QTimer.singleShot(0, self._fit_initial_window)
+
+    def _fit_initial_window(self):
+        available = self.screen().availableGeometry()
+        self.resize(min(1180, available.width() - 32),
+                    min(860, available.height() - 60))
+        self.move(available.center() - self.rect().center())
+
     # ------------------------------------------------------------------ UI --
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        outer = QVBoxLayout(central)
+        from .ui_layout import build_workspace
+        build_workspace(self, ChatPanel, BannerWidget)
 
-        # Left pane holds the entire existing extraction UI; the chat panel
-        # sits to its right in a splitter, and the banner spans the bottom.
-        left = QWidget()
-        root = QVBoxLayout(left)
+    def _show_settings(self):
+        screen = self.screen().availableGeometry()
+        self.settings_dialog.resize(min(560, screen.width() - 40),
+                                    min(680, screen.height() - 60))
+        self.settings_dialog.exec()
 
-        # --- Input group ---
-        in_group = QGroupBox("영상 URL (한 줄에 하나씩 입력)")
-        in_layout = QVBoxLayout(in_group)
-        self.url_input = QPlainTextEdit()
-        self.url_input.setPlaceholderText(
-            "https://www.youtube.com/watch?v=...\n"
-            "https://youtu.be/...\n"
-            "여러 개를 줄바꿈으로 구분해 붙여넣으세요."
-        )
-        self.url_input.setMaximumHeight(120)
-        in_layout.addWidget(self.url_input)
+    def _update_settings_summary(self, *_):
+        fmt = ("단락" if self._fmt_paragraph.isChecked() else
+               "타임스탬프" if self._fmt_timestamp.isChecked() else "문장")
+        parts = [f"동시 {self.concurrency.value()}개"]
+        if self.transcript_cb.isChecked():
+            parts = [self.lang_input.text().strip() or "en", fmt] + parts
+            if self.manual_cb.isChecked():
+                parts.append("수동 자막 우선")
+            if self.translate_cb.isChecked():
+                parts.append("한국어 저장")
+            if self.stt_cb.isChecked() and self._stt_available:
+                parts.append(f"음성 인식 {self.stt_model_combo.currentText().split()[0]}")
+            if self.stt_poll_spin.value():
+                parts.append(f"자막 대기 {self.stt_poll_spin.value()}분")
+        self.settings_summary.setText(" · ".join(parts))
 
-        btn_row = QHBoxLayout()
-        self.add_btn = QPushButton("목록에 추가")
-        self.add_btn.clicked.connect(self.on_add_urls)
-        btn_row.addWidget(self.add_btn)
-        btn_row.addStretch(1)
-        in_layout.addLayout(btn_row)
-        root.addWidget(in_group)
+    def _toggle_ai(self, checked=False):
+        self._show_ai(checked)
 
-        # --- Options group ---
-        opt_group = QGroupBox("옵션")
-        opt = QGridLayout(opt_group)
+    def _show_ai(self, visible=True):
+        if visible:
+            # Keep the extraction workspace usable on a small display.
+            if self.width() < 1100 and not self.ai_dock.isFloating():
+                self.ai_dock.setFloating(True)
+                screen = self.screen().availableGeometry()
+                self.ai_dock.resize(min(460, screen.width() - 40),
+                                    min(720, screen.height() - 60))
+                self.ai_dock.move(screen.center() - self.ai_dock.rect().center())
+            self.ai_dock.show()
+            self.resizeDocks([self.ai_dock], [410], Qt.Horizontal)
+            self.ai_dock.raise_()
+        else:
+            self.ai_dock.hide()
 
-        opt.addWidget(QLabel("저장 폴더:"), 0, 0)
-        self.dir_label = QLineEdit(self.out_dir)
-        self.dir_label.setReadOnly(True)
-        opt.addWidget(self.dir_label, 0, 1, 1, 2)
-        self.dir_btn = QPushButton("변경…")
-        self.dir_btn.clicked.connect(self.on_choose_dir)
-        opt.addWidget(self.dir_btn, 0, 3)
+    def _refresh_queue(self):
+        count = self.table.rowCount()
+        self.queue_count.setText(f"{count}개")
+        self.queue_stack.setCurrentIndex(1 if count else 0)
+        self.start_btn.setEnabled(not self._running and any(
+            self._row_status(r) == ST_PENDING for r in range(count)))
+        self.clear_all_btn.setEnabled(bool(count) and not self._running)
+        self.clear_done_btn.setEnabled(any(self._row_status(r) in
+            (ST_DONE, ST_PARTIAL, ST_ERROR) for r in range(count)))
+        self._refresh_result()
 
-        opt.addWidget(QLabel("선호 언어:"), 1, 0)
-        self.lang_input = QLineEdit("ko, en")
-        self.lang_input.setToolTip(
-            "쉼표로 구분한 언어 코드 우선순위 (예: ko, en, ja)"
-        )
-        opt.addWidget(self.lang_input, 1, 1)
+    def _refresh_result(self):
+        selected = self.table.selectionModel().selectedRows()
+        row = selected[0].row() if selected else None
+        paths = []
+        if row is None or self.table.item(row, COL_TITLE) is None:
+            self.result_title.setText("03   작업 결과")
+            self.result_detail.setText("목록에서 작업을 선택하면 진행 상황과 저장 파일을 확인할 수 있습니다.")
+        else:
+            status = self._row_status(row)
+            self.result_title.setText(f"03   작업 결과 · {status}")
+            item = self.table.item(row, COL_DETAIL)
+            self.result_detail.setText(item.text() if item and item.text() else "추출 시작을 기다리고 있습니다.")
+            paths = self._paths_by_job.get(self._job_id(row), [])
+        current_paths = [self.file_combo.itemData(i) for i in range(self.file_combo.count())]
+        if paths != current_paths:
+            previous = self.file_combo.currentData()
+            self.file_combo.clear()
+            for path in paths:
+                self.file_combo.addItem(f"{Path(path).suffix[1:].upper()}  ·  {Path(path).name}", path)
+            index = self.file_combo.findData(previous) if previous else -1
+            if index >= 0:
+                self.file_combo.setCurrentIndex(index)
+        self.file_actions.setVisible(bool(paths))
+        has_md = any(p.lower().endswith(".md") and Path(p).is_file() for p in paths)
+        self.summarize_btn.setEnabled(has_md)
+        self.translate_ai_btn.setEnabled(has_md)
 
-        opt.addWidget(QLabel("동시 작업 수:"), 1, 2)
-        self.concurrency = QSpinBox()
-        self.concurrency.setRange(1, 16)
-        self.concurrency.setValue(4)
-        opt.addWidget(self.concurrency, 1, 3)
+    def _open_result_file(self):
+        path = self.file_combo.currentData()
+        if not path:
+            return
+        if not Path(path).is_file():
+            QMessageBox.information(self, "파일 없음", "파일이 이동되거나 삭제되었습니다. 저장 폴더를 확인하세요.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
-        self.manual_cb = QCheckBox("수동 자막 우선")
-        self.manual_cb.setChecked(True)
-        self.manual_cb.setToolTip("끄면 자동 생성 자막도 동일하게 취급합니다.")
-        opt.addWidget(self.manual_cb, 2, 0, 1, 2)
+    def _open_result_folder(self):
+        path = self.file_combo.currentData()
+        if path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
 
-        from PySide6.QtWidgets import QButtonGroup
-        fmt_row = QHBoxLayout()
-        fmt_row.setSpacing(10)
-        self._fmt_sentence = QPushButton("Sentence\n문장 단위")
-        self._fmt_sentence.setCheckable(True)
-        self._fmt_sentence.setChecked(True)
-        self._fmt_sentence.setObjectName("fmtCard")
-        self._fmt_paragraph = QPushButton("Paragraph\n단락 단위")
-        self._fmt_paragraph.setCheckable(True)
-        self._fmt_paragraph.setObjectName("fmtCard")
-        self._fmt_timestamp = QPushButton("Timestamp\n타임스탬프")
-        self._fmt_timestamp.setCheckable(True)
-        self._fmt_timestamp.setObjectName("fmtCard")
-        self._fmt_group = QButtonGroup(self)
-        self._fmt_group.setExclusive(True)
-        self._fmt_group.addButton(self._fmt_sentence)
-        self._fmt_group.addButton(self._fmt_paragraph)
-        self._fmt_group.addButton(self._fmt_timestamp)
-        for b in (self._fmt_sentence, self._fmt_paragraph, self._fmt_timestamp):
-            fmt_row.addWidget(b)
-        fmt_widget = QWidget()
-        fmt_widget.setLayout(fmt_row)
-        opt.addWidget(fmt_widget, 2, 0, 1, 4)
-
-        # Output-type selection.
-        opt.addWidget(QLabel("추출 항목:"), 3, 0)
-        out_row = QHBoxLayout()
-        self.transcript_cb = QCheckBox("자막 (.md + .srt)")
-        self.transcript_cb.setToolTip("Markdown과 함께 원문 자막의 구간·시간 정보를 SRT로 저장합니다.")
-        self.transcript_cb.setChecked(True)
-        self.audio_cb = QCheckBox("MP3 음원")
-        self.video_cb = QCheckBox("MP4 영상")
-        out_row.addWidget(self.transcript_cb)
-        out_row.addWidget(self.audio_cb)
-        out_row.addWidget(self.video_cb)
-        out_row.addStretch(1)
-        out_widget = QWidget()
-        out_widget.setLayout(out_row)
-        opt.addWidget(out_widget, 3, 1)
-
-        opt.addWidget(QLabel("MP3 음질:"), 3, 2)
-        self.bitrate_combo = QComboBox()
-        self.bitrate_combo.addItems(["128 kbps", "192 kbps", "320 kbps"])
-        self.bitrate_combo.setCurrentIndex(1)  # 192
-        opt.addWidget(self.bitrate_combo, 3, 3)
-
-        opt.addWidget(QLabel("영상 화질:"), 3, 4)
-        self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["1080p", "720p", "원본(최고화질)"])
-        self.quality_combo.setCurrentIndex(0)  # 1080p
-        opt.addWidget(self.quality_combo, 3, 5)
-
-        self.translate_cb = QCheckBox("🌐 한국어 번역도 함께 저장 (.ko.md)")
-        self.translate_cb.setToolTip(
-            "원문이 한국어가 아닐 때, YouTube의 번역 자막을 별도 '.ko.md' "
-            "파일로 함께 저장합니다. 번역 자막이 없는 영상은 원문만 저장합니다."
-        )
-        opt.addWidget(self.translate_cb, 4, 0, 1, 6)
-
-        # --- STT fallback (자막이 없는 영상 / 라이브 영상 처리) ---
-        self.stt_cb = QCheckBox("🎙 자막 없으면 STT로 자동 생성 (Whisper)")
-        self.stt_cb.setToolTip(
-            "YouTube 자막이 없을 때 음성을 내려받아 내장 Whisper(whisper.cpp)로 "
-            "텍스트를 생성합니다. 라이브 영상도 지정한 시간만큼 캡처해 변환합니다. "
-            "GPU(Vulkan)가 있으면 자동으로 가속됩니다. "
-            "소스 실행 시 pywhispercpp 설치 필요: requirements-stt.txt 참고"
-        )
-        opt.addWidget(self.stt_cb, 5, 0, 1, 2)
-
-        opt.addWidget(QLabel("자막 대기:"), 5, 2)
-        self.stt_poll_spin = QSpinBox()
-        self.stt_poll_spin.setRange(0, 180)
-        # Default 0 = "don't poll, go straight to STT/none". Polling only helps
-        # when YouTube is *about* to publish captions (a live that's still being
-        # transcribed); for a fully caption-less VOD it just wastes minutes. Users
-        # who want polling opt in by raising this value.
-        self.stt_poll_spin.setValue(0)
-        self.stt_poll_spin.setSuffix(" 분")
-        self.stt_poll_spin.setToolTip(
-            "YouTube가 자동 자막을 생성할 때까지 대기하는 최대 시간. "
-            "0(기본)이면 대기 없이 바로 다음 단계로 넘어갑니다. "
-            "STT와 독립적으로 동작합니다."
-        )
-        opt.addWidget(self.stt_poll_spin, 5, 3)
-
-        opt.addWidget(QLabel("STT 모델:"), 5, 4)
-        self.stt_model_combo = QComboBox()
-        self.stt_model_combo.addItems(
-            ["tiny (빠름)", "base", "small (권장)", "medium", "large-v3 (정확)"]
-        )
-        self.stt_model_combo.setCurrentIndex(2)  # small
-        self.stt_model_combo.setToolTip(
-            "클수록 정확하지만 느리고 메모리를 많이 씁니다. small은 다국어/한국어 "
-            "모두 잘 처리합니다."
-        )
-        opt.addWidget(self.stt_model_combo, 5, 5)
-
-        opt.addWidget(QLabel("라이브 캡처:"), 6, 2)
-        self.stt_live_spin = QSpinBox()
-        self.stt_live_spin.setRange(0, 480)
-        self.stt_live_spin.setValue(60)
-        self.stt_live_spin.setSuffix(" 분")
-        self.stt_live_spin.setToolTip(
-            "라이브 영상에서 현재까지 방송된 구간(처음부터 N분)을 캡처해 "
-            "STT로 변환합니다. 0이면 라이브는 건너뜁니다."
-        )
-        opt.addWidget(self.stt_live_spin, 6, 3)
-
-        # Enable/disable dependent controls with their output type.
-        self.transcript_cb.toggled.connect(self._sync_output_controls)
-        self.audio_cb.toggled.connect(self._sync_output_controls)
-        self.video_cb.toggled.connect(self._sync_output_controls)
-        self.stt_cb.toggled.connect(self._sync_output_controls)
-        self._sync_output_controls()
-
-        root.addWidget(opt_group)
-
-        # --- Job table ---
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["영상 / URL", "상태", "진행률", "상세", "저장 파일"]
-        )
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.verticalHeader().setVisible(False)
-        hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(COL_TITLE, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(COL_PROGRESS, QHeaderView.Fixed)
-        self.table.setColumnWidth(COL_PROGRESS, 100)
-        hdr.setSectionResizeMode(COL_DETAIL, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(COL_FILE, QHeaderView.Stretch)
-        self.table.cellDoubleClicked.connect(self.on_row_double_clicked)
-        root.addWidget(self.table, stretch=1)
-
-        # --- Action row ---
-        action = QHBoxLayout()
-        self.start_btn = QPushButton("추출 시작")
-        self.start_btn.setObjectName("start_btn")
-        self.start_btn.setStyleSheet("font-weight: bold; padding: 6px 16px;")
-        self.start_btn.clicked.connect(self.on_start)
-        action.addWidget(self.start_btn)
-
-        self.clear_done_btn = QPushButton("완료 항목 지우기")
-        self.clear_done_btn.clicked.connect(self.on_clear_done)
-        action.addWidget(self.clear_done_btn)
-
-        self.clear_all_btn = QPushButton("전체 지우기")
-        self.clear_all_btn.clicked.connect(self.on_clear_all)
-        action.addWidget(self.clear_all_btn)
-
-        self.open_dir_btn = QPushButton("저장 폴더 열기")
-        self.open_dir_btn.clicked.connect(self.on_open_dir)
-        action.addWidget(self.open_dir_btn)
-
-        self.summarize_btn = QPushButton("🤖 AI로 요약")
-        self.summarize_btn.setToolTip(
-            "선택한(또는 가장 최근) 자막을 오른쪽 AI 채팅 '요약' 탭으로 "
-            "불러와 한국어로 요약합니다."
-        )
-        self.summarize_btn.clicked.connect(self.on_ai_summarize)
-        action.addWidget(self.summarize_btn)
-
-        self.translate_ai_btn = QPushButton("🌐 AI로 번역")
-        self.translate_ai_btn.setToolTip(
-            "선택한(또는 가장 최근) 자막을 오른쪽 AI 채팅 '번역' 탭으로 "
-            "불러와 자연스러운 한국어로 번역합니다."
-        )
-        self.translate_ai_btn.clicked.connect(self.on_ai_translate)
-        action.addWidget(self.translate_ai_btn)
-
-        action.addStretch(1)
-        root.addLayout(action)
-
-        # --- Progress + status bar ---
-        self.progress = QProgressBar()
-        self.progress.setTextVisible(True)
-        self.progress.setFormat("%v / %m")
-        root.addWidget(self.progress)
-
-        # --- Right pane: AI chat ---
-        self.chat = ChatPanel(self)
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left)
-        splitter.addWidget(self.chat)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([760, 500])
-        outer.addWidget(splitter, stretch=1)
-
-        # --- Company ad banner (clickable, spans full width at the bottom) ---
-        self.banner = BannerWidget(image_path=_banner_image_path())
-        outer.addWidget(self.banner)
-
-        self.statusBar().showMessage("준비됨")
-
-        self._paths_by_job: dict[int, list[str]] = {}
-        self._next_job_id = 0
+    def _register_translation_output(self, source_path: str, output_path: str):
+        for paths in self._paths_by_job.values():
+            if source_path in paths and output_path not in paths:
+                paths.append(output_path)
+        self._refresh_result()
 
     # ------------------------------------------------------------- helpers --
     def _sync_output_controls(self):
-        want_t = self.transcript_cb.isChecked()
-        want_a = self.audio_cb.isChecked()
+        want_t = self.transcript_cb.isChecked() and not self._running
+        want_a = self.audio_cb.isChecked() and not self._running
         self.lang_input.setEnabled(want_t)
         self.manual_cb.setEnabled(want_t)
         for b in (self._fmt_sentence, self._fmt_paragraph, self._fmt_timestamp):
             b.setEnabled(want_t)
         self.translate_cb.setEnabled(want_t)
         self.bitrate_combo.setEnabled(want_a)
-        self.quality_combo.setEnabled(self.video_cb.isChecked())
+        self.quality_combo.setEnabled(self.video_cb.isChecked() and not self._running)
+        self.bitrate_combo.setVisible(self.audio_cb.isChecked())
+        self.bitrate_label.setVisible(self.audio_cb.isChecked())
+        self.quality_combo.setVisible(self.video_cb.isChecked())
+        self.quality_label.setVisible(self.video_cb.isChecked())
+        self.quality_options.setVisible(self.audio_cb.isChecked() or self.video_cb.isChecked())
         # STT controls only make sense when transcript output is selected.
         stt_enabled = want_t and self._stt_available
         self.stt_cb.setEnabled(stt_enabled)
@@ -1282,6 +1099,7 @@ class MainWindow(QMainWindow):
         # Live capture and model size feed STT, so they stay gated on STT on.
         self.stt_live_spin.setEnabled(stt_active)
         self.stt_model_combo.setEnabled(stt_active)
+        self._update_settings_summary()
 
     def _probe_stt_async(self):
         """Detect pywhispercpp off the UI thread so import cost never blocks.
@@ -1337,6 +1155,10 @@ class MainWindow(QMainWindow):
         # Guard every widget touch so a late probe result never crashes exit.
         try:
             self._stt_available = bool(available)
+            self.stt_hint.setText(
+                "자막이 없을 때만 음성을 분석합니다. 첫 사용 시 모델을 다운로드합니다."
+                if available else "음성 인식 구성요소가 없어 사용할 수 없습니다."
+            )
             if not self._stt_available:
                 self.stt_cb.setChecked(False)
                 self.stt_cb.setToolTip(
@@ -1372,13 +1194,16 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
         item = QTableWidgetItem(url)
+        item.setToolTip(url)
         item.setData(Qt.UserRole, self._next_job_id)
+        item.setData(Qt.UserRole + 1, url)
         self._next_job_id += 1
         self.table.setItem(row, COL_TITLE, item)
         self._set_status_item(row, ST_PENDING)
         self.table.setCellWidget(row, COL_PROGRESS, self._make_progress_bar())
         self.table.setItem(row, COL_DETAIL, QTableWidgetItem(""))
         self.table.setItem(row, COL_FILE, QTableWidgetItem(""))
+        self._refresh_queue()
 
     def _job_id(self, row: int) -> int:
         return self.table.item(row, COL_TITLE).data(Qt.UserRole)
@@ -1395,8 +1220,11 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- slots ---
     def on_add_urls(self):
+        if self._running:
+            return
         text = self.url_input.toPlainText()
         added, skipped = 0, 0
+        invalid = []
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -1405,13 +1233,16 @@ class MainWindow(QMainWindow):
                 extract_video_id(line)  # validate
             except ExtractionError:
                 skipped += 1
+                invalid.append(line)
                 continue
             self._add_job_row(line)
             added += 1
-        self.url_input.clear()
+        self.url_input.setPlainText("\n".join(invalid))
+        if added:
+            self.table.selectRow(self.table.rowCount() - 1)
         msg = f"{added}개 추가됨"
         if skipped:
-            msg += f", {skipped}개는 인식 불가로 건너뜀"
+            msg += f", 인식할 수 없는 {skipped}개 링크는 입력창에서 확인하세요"
         self.statusBar().showMessage(msg)
 
     def on_choose_dir(self):
@@ -1419,6 +1250,8 @@ class MainWindow(QMainWindow):
         if d:
             self.out_dir = d
             self.dir_label.setText(d)
+            self.dir_label.setCursorPosition(0)
+            self.dir_label.setToolTip(d)
 
     def on_open_dir(self):
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
@@ -1426,9 +1259,10 @@ class MainWindow(QMainWindow):
 
     def on_clear_done(self):
         for row in range(self.table.rowCount() - 1, -1, -1):
-            if self._row_status(row) in (ST_DONE, ST_ERROR):
+            if self._row_status(row) in (ST_DONE, ST_PARTIAL, ST_ERROR):
                 self._paths_by_job.pop(self._job_id(row), None)
                 self.table.removeRow(row)
+        self._refresh_queue()
 
     def on_clear_all(self):
         if self._running:
@@ -1437,7 +1271,8 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self._paths_by_job.clear()
         self.progress.setValue(0)
-        self.progress.setMaximum(0)
+        self.progress.setMaximum(1)
+        self._refresh_queue()
 
     def on_row_double_clicked(self, row: int, _col: int):
         paths = self._paths_by_job.get(self._job_id(row)) or []
@@ -1447,9 +1282,9 @@ class MainWindow(QMainWindow):
                 return
 
     def _selected_transcript_path(self):
-        """The .md transcript to summarize: the selected row's, else newest."""
+        """Use the selected job only; fall back to newest only without a selection."""
         selected = [i.row() for i in self.table.selectionModel().selectedRows()]
-        order = selected + list(range(self.table.rowCount() - 1, -1, -1))
+        order = selected or list(range(self.table.rowCount() - 1, -1, -1))
         seen = set()
         for row in order:
             if row in seen:
@@ -1482,6 +1317,7 @@ class MainWindow(QMainWindow):
         except OSError as e:
             QMessageBox.warning(self, "읽기 실패", str(e))
             return
+        self._show_ai()
         self.chat.load_transcript(
             Path(path).name, text, summarize=summarize, translate=translate,
             path=path,
@@ -1489,7 +1325,7 @@ class MainWindow(QMainWindow):
 
     def _set_controls_enabled(self, enabled: bool):
         for w in (self.start_btn, self.add_btn, self.dir_btn,
-                  self.concurrency, self.clear_all_btn,
+                  self.concurrency, self.clear_all_btn, self.url_input,
                   self.transcript_cb, self.audio_cb, self.video_cb):
             w.setEnabled(enabled)
         if enabled:
@@ -1501,6 +1337,7 @@ class MainWindow(QMainWindow):
                       self.stt_cb, self.stt_poll_spin,
                       self.stt_live_spin, self.stt_model_combo):
                 w.setEnabled(False)
+        self._refresh_queue()
 
     def on_start(self):
         if self._running:
@@ -1576,7 +1413,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{self._total}개 작업 시작…")
 
         for row in pending:
-            url = self.table.item(row, COL_TITLE).text()
+            title_item = self.table.item(row, COL_TITLE)
+            url = title_item.data(Qt.UserRole + 1) or title_item.text()
             worker = ExtractWorker(
                 self._job_id(row), url, self.out_dir, outputs,
                 langs, prefer_manual, transcript_format, bitrate,
@@ -1598,34 +1436,40 @@ class MainWindow(QMainWindow):
         row = self._job_row(job_id)
         if row is not None:
             self._set_status_item(row, status)
+            bar = self.table.cellWidget(row, COL_PROGRESS)
+            if status == ST_RUNNING:
+                bar.setRange(0, 0)
+                bar.setFormat("")
+            elif status in (ST_DONE, ST_PARTIAL, ST_ERROR):
+                bar.setRange(0, 100)
+                bar.setValue(100 if status == ST_DONE else 0)
+                bar.setFormat("완료" if status == ST_DONE else "확인 필요")
+            self._refresh_queue()
 
     @Slot(int, str)
     def _on_worker_detail(self, job_id: int, msg: str):
         row = self._job_row(job_id)
         if row is None:
             return
-        self.table.setItem(row, COL_DETAIL, QTableWidgetItem(msg))
+        item = QTableWidgetItem(msg)
+        item.setToolTip(msg)
+        self.table.setItem(row, COL_DETAIL, item)
         self._update_row_progress(row, msg)
+        self._refresh_result()
 
     def _update_row_progress(self, row: int, msg: str):
-        """Drive a row's progress bar from an [MP3]/[STT]/[폴링] detail message.
-
-        Percentage messages advance the bar; terminal phases ("변환 중", "저장
-        완료", "다운로드 완료") peg it to 100%. Anything without a known signal
-        is left alone so the bar doesn't jitter.
-        """
-        if not any(tag in msg for tag in ("[MP3]", "[STT]", "[폴링]")):
-            return
+        """Show measured phase progress; unknown phases remain indeterminate."""
         bar = self.table.cellWidget(row, COL_PROGRESS)
         if bar is None:
             return
         m = _PCT_RE.search(msg)
         if m:
+            bar.setRange(0, 100)
+            bar.setFormat("%p%")
             bar.setValue(min(100, int(float(m.group(1)))))
-        elif any(k in msg for k in (
-            "변환 중", "저장 완료", "다운로드 완료", "마크다운 저장",
-        )):
-            bar.setValue(100)
+        else:
+            bar.setRange(0, 0)
+            bar.setFormat("")
 
     @Slot(int, object)
     def _on_worker_finished(self, job_id: int, result: dict):
@@ -1634,6 +1478,8 @@ class MainWindow(QMainWindow):
         errors = result.get("errors", [])
 
         if files and row is not None:
+            title_item = self.table.item(row, COL_TITLE)
+            title_item.setText(Path(files[0][1]).stem.removesuffix(".stt"))
             # Remember paths for double-click (open the first produced file).
             self._paths_by_job[job_id] = [p for _label, p in files]
             names = "  |  ".join(f"{lbl}: {Path(p).name}" for lbl, p in files)
@@ -1648,7 +1494,9 @@ class MainWindow(QMainWindow):
         else:
             detail = "저장 완료"
         if row is not None:
-            self.table.setItem(row, COL_DETAIL, QTableWidgetItem(detail))
+            item = QTableWidgetItem(detail)
+            item.setToolTip(detail)
+            self.table.setItem(row, COL_DETAIL, item)
 
         self._completed += 1
         self.progress.setValue(self._completed)
@@ -1666,6 +1514,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"완료: 성공 {n_done}개, 부분 완료 {n_partial}개, 실패 {n_error}개"
             )
+        self._refresh_queue()
 
     def closeEvent(self, event):
         # Confirm before abandoning in-flight work.
@@ -1713,8 +1562,8 @@ def _run_selftest() -> int:
     """Headless sanity check used to validate a packaged build.
 
     Verifies that bundled resources and runtime dependencies resolve in the
-    (possibly frozen) environment: the banner image, the ffmpeg binary, and
-    the yt-dlp import. Returns a process exit code; writes a result line to a
+    (possibly frozen) environment: the GUI, ffmpeg binary, and YouTube runtime.
+    Returns a process exit code; writes a result line to a
     file when SELFTEST_OUT is set (windowed builds have no stdout).
     """
     import os
@@ -1779,6 +1628,8 @@ def _run_selftest() -> int:
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         app = QApplication(sys.argv)
+        from .theme import apply_theme
+        apply_theme(app)
         win = MainWindow()
         out_dir = Path(win.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1790,6 +1641,7 @@ def _run_selftest() -> int:
             pass
         win.show()
         app.processEvents()
+        win.close()
     except Exception as e:
         problems.append(f"GUI/output setup failed: {e}")
 
@@ -1811,20 +1663,16 @@ def _run_screenshot(path: str) -> int:
     Avoids OS screen-capture quirks; used to preview the UI. Returns exit code.
     """
     app = QApplication(sys.argv)
+    from .theme import apply_theme
+    apply_theme(app)
     win = MainWindow()
-    win.resize(980, 720)
-    win.url_input.setPlainText(
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ\n"
-        "https://youtu.be/9bZkp7q19f0"
-    )
-    win.on_add_urls()
-    win.audio_cb.setChecked(True)
     win.show()
     for _ in range(5):
         app.processEvents()
     pix = win.grab()
     ok = pix.save(path)
     print(f"screenshot {'saved' if ok else 'FAILED'}: {path}")
+    win.close()
     return 0 if ok else 1
 
 
@@ -1837,110 +1685,20 @@ def main():
         sys.exit(_run_screenshot(out))
     app = QApplication(sys.argv)
     app.setApplicationName("YouTube 자막 추출기")
+    from .theme import apply_theme
+    apply_theme(app)
 
     from yt_extractor.splash import make_splash
     splash = make_splash()
     splash.show()
     app.processEvents()
 
-    app.setStyleSheet("""
-        QWidget { background-color: #f6f2ea; color: #2a2622;
-                  font-family: 'Gothic A1', 'Apple SD Gothic Neo', 'Malgun Gothic', system-ui, sans-serif; }
-        QMainWindow { background-color: #efe8da; }
-        QMainWindow::centralWidget { background-color: #f6f2ea; }
-
-        QGroupBox { border: none; background: #ffffff; border-radius: 16px;
-                    padding: 16px; padding-top: 24px; margin-top: 8px; }
-        QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left;
-                           left: 16px; top: 4px; color: #8a836f; font-size: 12px;
-                           font-weight: 700; letter-spacing: 1px; }
-
-        QPlainTextEdit { border: 1px solid #ece5d8; border-radius: 12px;
-                         background: #ffffff; padding: 8px; }
-        QLineEdit { border: 1px solid #ece5d8; border-radius: 12px;
-                    background: #ffffff; padding: 6px 10px; }
-        QLineEdit[readOnly="true"] { background: #efe8da; color: #575451; }
-
-        QPushButton { background: #2a2622; color: #ffffff; border-radius: 12px;
-                      padding: 8px 16px; font-weight: 700; border: none; }
-        QPushButton:hover { background: #3d3733; }
-        QPushButton:pressed { background: #1a1614; }
-        QPushButton:disabled { background: #c9c2b2; color: #8a836f; }
-
-        QPushButton#start_btn { background: #f47458; color: #ffffff;
-                                font-size: 14px; padding: 12px 24px; }
-        QPushButton#start_btn:hover { background: #e85d3e; }
-        QPushButton#start_btn:disabled { background: #c9c2b2; color: #ffffff; }
-
-        QPushButton#fmtCard { background: #ffffff; color: #2a2622;
-                               border: 1px solid #ece5d8; border-radius: 12px;
-                               padding: 12px 8px; font-weight: 400; }
-        QPushButton#fmtCard:checked { background: #cde86a; border: 1px solid #b3cf4e;
-                                       font-weight: 700; color: #2a2622; }
-        QPushButton#fmtCard:hover { background: #f6f2ea; }
-        QPushButton#fmtCard:checked:hover { background: #bdd860; }
-
-        QComboBox { border: 1px solid #ece5d8; border-radius: 12px;
-                    background: #ffffff; padding: 6px 10px; }
-        QComboBox::drop-down { border: none; width: 20px; }
-        QComboBox QAbstractItemView { background: #ffffff; border: 1px solid #ece5d8;
-                                       selection-background-color: #cde86a;
-                                       selection-color: #2a2622; }
-
-        QSpinBox { border: 1px solid #ece5d8; border-radius: 12px;
-                   background: #ffffff; padding: 6px 10px; }
-        QSpinBox::up-button, QSpinBox::down-button { width: 18px; border: none; }
-
-        QCheckBox { color: #2a2622; spacing: 6px; }
-        QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #c9c2b2;
-                               border-radius: 4px; background: #ffffff; }
-        QCheckBox::indicator:checked { background: #f47458; border-color: #f47458; }
-
-        QProgressBar { border: none; border-radius: 999px; background: #ece4d4;
-                       min-height: 6px; max-height: 6px; }
-        QProgressBar::chunk { background: #b3cf4e; border-radius: 999px; }
-
-        QProgressBar#rowProgress { min-height: 20px; max-height: 20px; border-radius: 4px;
-                                   border: 1px solid #ddd5c8; font-size: 11px; color: #2a2622; }
-        QProgressBar#rowProgress::chunk { border-radius: 3px; }
-
-        QTableWidget { border: none; background: #ffffff; gridline-color: #ece5d8;
-                       border-radius: 12px; }
-        QTableWidget::item { padding: 6px 8px; border: none; }
-        QTableWidget::item:selected { background: #eef6cf; color: #2a2622; }
-        QHeaderView::section { background: #f6f2ea; border: none; border-bottom: 1px solid #ece5d8;
-                                padding: 6px 8px; font-weight: 700; color: #8a836f;
-                                font-size: 12px; }
-
-        QTabWidget::pane { border: none; background: transparent; }
-        QTabBar::tab { background: transparent; color: #8a836f; padding: 6px 18px;
-                       border-radius: 999px; font-weight: 600; margin: 2px; }
-        QTabBar::tab:selected { background: #f47458; color: #ffffff; }
-        QTabBar::tab:hover:!selected { background: #ece5d8; color: #2a2622; }
-
-        QTextBrowser { border: none; background: #efe8da; border-radius: 12px; }
-
-        QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
-        QScrollBar::handle:vertical { background: rgba(42,38,34,0.18); border-radius: 999px;
-                                       min-height: 24px; }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-        QScrollBar:horizontal { background: transparent; height: 8px; margin: 0; }
-        QScrollBar::handle:horizontal { background: rgba(42,38,34,0.18); border-radius: 999px;
-                                         min-width: 24px; }
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-
-        QLabel { background: transparent; }
-        QSplitter::handle { background: #ece5d8; }
-        QStatusBar { background: #f6f2ea; color: #8a836f; font-size: 12px; }
-        QMessageBox { background: #f6f2ea; }
-    """)
     win = MainWindow()
     win.show()
     app.processEvents()
 
     # Always open on primary monitor (frameGeometry is valid after show)
-    primary = app.primaryScreen().geometry()
+    primary = app.primaryScreen().availableGeometry()
     fg = win.frameGeometry()
     win.move(
         primary.x() + (primary.width() - fg.width()) // 2,
