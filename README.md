@@ -1,6 +1,6 @@
 # YouTube 자막 추출기 (YouTube Transcript Extractor)
 
-[![Version 1.2.1](https://img.shields.io/badge/version-1.2.1-3264da)](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.2.1)
+[![Version 1.2.2](https://img.shields.io/badge/version-1.2.2-3264da)](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.2.2)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![PySide6 / Qt 6](https://img.shields.io/badge/GUI-PySide6%20%2F%20Qt%206-41CD52)
@@ -9,24 +9,24 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 
 ![YouTube 자막 추출기 — 영상 추가, 작업 목록, 결과 확인으로 구성한 새 UI](docs/screenshot.png)
 
-*1.2.1 배포 ZIP을 풀고 EXE를 실행해 캡처한 메인 화면입니다.*
+*1.2.2 배포 ZIP을 풀고 EXE를 실행해 캡처한 메인 화면입니다.*
 
 <details>
 <summary>앱 시작 화면 보기</summary>
 
-![1.2.1 앱 시작 화면](docs/screenshot-splash.png)
+![1.2.2 앱 시작 화면](docs/screenshot-splash.png)
 
 </details>
 
 ## Windows 다운로드 및 실행
 
-1. [1.2.1 릴리스](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.2.1)에서 `YouTubeTranscriptExtractor.zip`을 내려받습니다.
+1. [1.2.2 릴리스](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/tag/release-1.2.2)에서 `YouTubeTranscriptExtractor.zip`을 내려받습니다.
 2. ZIP **전체를 압축 해제**하고 `YouTubeTranscriptExtractor.exe`를 실행합니다. EXE와 `_internal` 폴더는 함께 보관해야 합니다.
 3. YouTube 링크를 넣고 **작업 추가 → 추출 시작**을 누릅니다. 기본 선택인 `자막 MD + SRT`는 읽기용 Markdown과 원문 타임스탬프를 보존한 SRT를 함께 저장합니다.
 
 배포 ZIP에는 Python 실행 환경, Node.js, FFmpeg 및 AI 추론 엔진이 포함됩니다. AI 모델 가중치는 첫 사용 시 별도로 다운로드하며, 이미 받은 모델은 업데이트 후에도 재사용합니다. ZIP 크기는 **181.3 MiB**이며 릴리스에 `SHA256SUMS.txt`를 함께 제공합니다.
 
-**1.2.1 변경 사항:** 요약·번역용 CPU 전용 엔진을 Vulkan 지원 엔진으로 교체했습니다. 실제 사용 GPU와 적재된 레이어 수를 AI 작업 공간에 표시하며, GPU를 사용할 수 없으면 사유와 함께 CPU로 실행합니다.
+**1.2.2 변경 사항:** 앱 아이콘과 메인·시작 화면을 다듬고, 작업 중지·다시 시도, 중복 URL 방지, 설정 복원과 단축키를 추가했습니다. 1.2.1의 Vulkan GPU 엔진과 실제 장치·레이어 수 표시를 유지합니다.
 
 ## 개발 언어 및 기술 구성
 
@@ -67,7 +67,7 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 
 ![실제 YouTube 자막 추출 완료 후 내장 모델로 요약한 화면](docs/screenshot-ai.png)
 
-*1.2.1에서 실제 자막을 요약한 화면입니다. AI 작업 공간에 사용 GPU와 적재 레이어 수가 표시됩니다.*
+*1.2.2에서 실제 자막을 요약한 화면입니다. AI 작업 공간에 사용 GPU와 적재 레이어 수가 표시됩니다.*
 
 - **요약 탭** — 자막 핵심 내용을 한국어로 요약
 - **번역 탭** — 자막 전체를 한국어로 번역, 완료 시 자동으로 `.ko.md` 파일로 저장 (체크박스 옵션)
@@ -77,18 +77,18 @@ YouTube 영상 링크를 입력하면 자막(transcript)을 추출해 **마크�
 
 ### 실제 GPU 추론 검증
 
-최종 1.2.1 ZIP을 별도 폴더에 풀고, 배포 EXE에서 모델을 로드해 실제 한국어 텍스트를 생성했습니다.
+최종 1.2.2 ZIP을 별도 폴더에 풀고, 배포 EXE에서 모델을 로드해 실제 한국어 텍스트를 생성했습니다.
 
 | 검증 항목 | 결과 |
 |-----------|------|
 | 추론 장치 / 백엔드 | NVIDIA GeForce RTX 4090 / Vulkan |
 | GPU 적재 레이어 | **43 / 43** |
 | GPU 모델 버퍼 | **2868.04 MiB** |
-| 짧은 번역 생성 | 모델 준비 후 **2.216초** |
+| 짧은 번역 생성 | 모델 준비 후 **2.121초** |
 | CPU 대체 실행 | 강제 CPU 설정 및 GPU 사용 불가 조건에서 실제 추론 성공 |
-| 자동 테스트 / 배포 검사 | 76개 테스트 통과, EXE 자체 검사 통과 |
+| 자동 테스트 / 배포 검사 | 81개 테스트 통과, EXE 자체 검사 통과 |
 
-측정 결과는 [GPU-VALIDATION.json](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/download/release-1.2.1/GPU-VALIDATION.json)에서 확인할 수 있습니다. 생성 시간에는 모델 다운로드·로딩·워밍업이 포함되지 않으며, 전체 자막 요약·번역 시간은 입력 길이와 장치에 따라 달라집니다. 위 수치는 RTX 4090에서 확인한 결과입니다.
+측정 결과는 [GPU-VALIDATION.json](https://github.com/mazelines/YOUTUBE-SCRIPT-EXTRACT/releases/download/release-1.2.2/GPU-VALIDATION.json)에서 확인할 수 있습니다. 생성 시간에는 모델 다운로드·로딩·워밍업이 포함되지 않으며, 전체 자막 요약·번역 시간은 입력 길이와 장치에 따라 달라집니다. 위 수치는 RTX 4090에서 확인한 결과입니다.
 
 AI 작업 공간에 `GPU · NVIDIA GeForce RTX 4090 · 43/43 레이어`처럼 표시되면 실제 GPU 적재가 확인된 상태입니다. 모델 로딩이 끝나기 전에는 GPU 사용 여부를 확정하지 않습니다.
 
