@@ -23,6 +23,16 @@ function Write-Fail($msg) { Write-Host "ERR $msg" -ForegroundColor Red }
 
 # --- 1) Clean previous build artifacts ---------------------------------------
 if (-not $SkipBuild) {
+    # Resolve the build tool before touching a previous working bundle.
+    $pyinstallerCommand = Get-Command pyinstaller -ErrorAction Stop
+    # Fail before deleting anything if the user is running this local bundle.
+    $distRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot 'dist')) + [IO.Path]::DirectorySeparatorChar
+    $activeBundle = Get-Process -Name $AppName -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and $_.Path.StartsWith($distRoot, [StringComparison]::OrdinalIgnoreCase)
+    }
+    if ($activeBundle) {
+        throw "The app is running from dist/. Close it before rebuilding, or build into a separate directory."
+    }
     Write-Step 'Cleaning build/ and dist/'
     foreach ($d in @('build', 'dist')) {
         $target = [IO.Path]::GetFullPath((Join-Path $projectRoot $d))
@@ -41,7 +51,7 @@ if (-not $SkipBuild) {
 # --- 2) PyInstaller build (onedir) -------------------------------------------
 if (-not $SkipBuild) {
     Write-Step "PyInstaller $SpecFile"
-    & pyinstaller $SpecFile --noconfirm --log-level WARN
+    & $pyinstallerCommand.Source $SpecFile --noconfirm --log-level WARN
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "PyInstaller failed (exit $LASTEXITCODE)"
         exit 1

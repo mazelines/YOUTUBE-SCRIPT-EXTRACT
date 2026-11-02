@@ -175,7 +175,10 @@ class ExtractWorker(QRunnable):
                         progress=lambda m: self.signals.detail.emit(job_id, f"[자막] {m}"),
                     )
                 for i, p in enumerate(paths):
-                    label = "자막" if i == 0 else f"번역({self.translate_to})"
+                    if p.suffix.lower() == ".srt":
+                        label = "SRT (STT)" if p.name.endswith(".stt.srt") else "SRT 원본"
+                    else:
+                        label = "자막" if i == 0 else f"번역({self.translate_to})"
                     files.append((label, str(p)))
             except ExtractionError as e:
                 errors.append(("자막", str(e)))
@@ -348,7 +351,7 @@ class PreloadWorker(QRunnable):
         self.signals.done.emit()
 
 
-BANNER_URL = "https://mazeline.tech/"
+BANNER_URL = "https://www.mazeline.tech"
 
 
 def _default_output_dir() -> str:
@@ -464,7 +467,7 @@ class BannerWidget(QFrame):
 
         lay.addStretch(1)
 
-        link = QLabel("mazeline.tech ↗")
+        link = QLabel("www.mazeline.tech ↗")
         link.setStyleSheet(
             "font-size: 13px; font-weight: 700; color: #f47458;"
             "font-family: 'JetBrains Mono', 'Consolas', monospace;"
@@ -1083,7 +1086,8 @@ class MainWindow(QMainWindow):
         # Output-type selection.
         opt.addWidget(QLabel("추출 항목:"), 3, 0)
         out_row = QHBoxLayout()
-        self.transcript_cb = QCheckBox("자막 (.md)")
+        self.transcript_cb = QCheckBox("자막 (.md + .srt)")
+        self.transcript_cb.setToolTip("Markdown과 함께 원문 자막의 구간·시간 정보를 SRT로 저장합니다.")
         self.transcript_cb.setChecked(True)
         self.audio_cb = QCheckBox("MP3 음원")
         self.video_cb = QCheckBox("MP4 영상")
@@ -1729,6 +1733,23 @@ def _run_selftest() -> int:
         import yt_dlp  # noqa: F401
     except Exception as e:
         problems.append(f"yt_dlp import failed: {e}")
+
+    try:
+        import yt_dlp_ejs
+        from importlib.resources import files
+        from .core import _youtube_runtime_opts
+        scripts = files(yt_dlp_ejs) / "yt" / "solver"
+        if not (scripts / "core.min.js").is_file():
+            raise RuntimeError("YouTube EJS solver data missing")
+        node = _youtube_runtime_opts().get("js_runtimes", {}).get("node", {}).get("path")
+        if not node:
+            raise RuntimeError("Node.js 22+ runtime missing")
+        flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        version = subprocess.check_output([node, "--version"], text=True, timeout=10, **flags).strip()
+        if int(version.lstrip("v").split(".")[0]) < 22:
+            raise RuntimeError(f"Node.js too old: {version}")
+    except Exception as e:
+        problems.append(f"YouTube JS setup failed: {e}")
 
     # Built-in CPU model engine is optional (bundled only when llama-cpp-python
     # is installed at build time). Report whether it loaded so a release that's

@@ -8,17 +8,38 @@ Bundles, in addition to the Python code and PySide6:
   - all yt-dlp submodules (its extractors are imported dynamically).
 
 Build:  pyinstaller YouTubeTranscriptExtractor.spec
-Output: dist/YouTubeTranscriptExtractor.exe  (single file, no console)
+Output: dist/YouTubeTranscriptExtractor/ (folder bundle, no console)
 """
 
 from PyInstaller.utils.hooks import (
     collect_submodules, collect_data_files, collect_dynamic_libs,
 )
+from pathlib import Path
+import shutil
+import subprocess
+from urllib.request import urlopen
 
 datas = [("yt_extractor/img/mazelinebanner.jpg", "yt_extractor/img")]
 datas += collect_data_files("imageio_ffmpeg")        # ffmpeg binary
 
 hiddenimports = collect_submodules("yt_dlp")          # dynamic extractors
+hiddenimports += collect_submodules("yt_dlp_ejs")
+datas += collect_data_files("yt_dlp_ejs")
+
+# YouTube player challenges require a JS runtime even in a frozen build.
+# Ship Node and its exact-version license so end users need no extra install.
+node = shutil.which("node")
+if not node:
+    raise RuntimeError("Install Node.js 22+ and add it to PATH before building.")
+node_version = subprocess.check_output([node, "--version"], text=True).strip()
+if int(node_version.lstrip("v").split(".")[0]) < 22:
+    raise RuntimeError("Node.js 22+ is required for YouTube downloads.")
+license_path = Path(".zcode") / "node-runtime" / node_version / "LICENSE"
+if not license_path.exists():
+    license_path.parent.mkdir(parents=True, exist_ok=True)
+    with urlopen(f"https://raw.githubusercontent.com/nodejs/node/{node_version}/LICENSE", timeout=30) as resp:
+        license_path.write_bytes(resp.read())
+datas += [(str(license_path), "node")]
 
 # Chat HTML renderer: markdown loads extensions by name string and pygments
 # loads its style/lexer modules dynamically — PyInstaller's static scan misses
@@ -29,7 +50,7 @@ hiddenimports += collect_submodules("pygments")
 # Built-in CPU LLM: bundle llama-cpp-python's compiled library + data, but only
 # if it's installed (keeps builds working on clones without the optional dep).
 # The GGUF model is NOT bundled — it's downloaded from Hugging Face on first use.
-binaries = []
+binaries = [(node, "node")]
 try:
     binaries += collect_dynamic_libs("llama_cpp")
     datas += collect_data_files("llama_cpp")

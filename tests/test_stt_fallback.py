@@ -86,6 +86,9 @@ class _BasePipelineTest(unittest.TestCase):
             "save_markdown": mock.patch.object(
                 core, "save_markdown", side_effect=self._fake_save,
             ),
+            "save_srt": mock.patch.object(
+                core, "save_srt", side_effect=self._fake_save,
+            ),
             "is_stt_available": mock.patch.object(
                 stt, "is_stt_available", return_value=True,
             ),
@@ -113,7 +116,8 @@ class CaptionPresentTests(_BasePipelineTest):
             "https://youtu.be/vid", "/tmp/out",
             stt_fallback=True, poll_wait_min=30,
         )
-        self.assertEqual(len(paths), 1)
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(paths[1].suffix, ".srt")
         self.mocks["fetch_transcript_with_polling"].assert_not_called()
         self.mocks["_download_for_stt"].assert_not_called()
         self.mocks["_run_stt"].assert_not_called()
@@ -225,7 +229,7 @@ class STTFallbackTests(_BasePipelineTest):
         extract_to_markdown_with_fallback(
             "https://youtu.be/vid", "/tmp/out", stt_fallback=True,
         )
-        self.assertEqual(len(self.saved_paths), 1)
+        self.assertEqual(len(self.saved_paths), 2)
 
 
 class NoFallbackTests(_BasePipelineTest):
